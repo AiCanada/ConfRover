@@ -11,6 +11,10 @@ Local DPF fine-tune work on top of official ConfRover v1.0 (inference-only).
 
 ### Added
 
+- `docker/Dockerfile` + `docker-compose.yml`: a container for the PDB-cluster cloud
+  run (code + bootstrap on the torch 2.13 / CUDA 12.6 base; payload pulled into a
+  volume at first start). Modes `smoke` / `train` / `verify` / `shell`.
+  `.gitattributes` pins shell, Dockerfile and YAML files to LF.
 - Cloud run for the PDB-cluster corpus: `stage_remote_payload.py --catalog` ships a
   catalog JSON by member path (required for the unique catalog, whose merged
   families span several cluster directories), `--weights` ships one chosen

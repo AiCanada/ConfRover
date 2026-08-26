@@ -59,5 +59,5 @@ py -3.13 -m confrover.cli train `
   --lr 1e-4 --lr_schedule cosine --lr_warmup_steps 50 --lr_min_ratio 0.1 `
   --seed 42 `
   --rescale_attention 0 `
-  --ckpt_every_n_steps 500 --val_every_n_steps 200 --log_every_n_steps 10 `
+  --ckpt_every_n_steps 500 --val_every_n_steps 500 --log_every_n_steps 10 `
   --resume auto

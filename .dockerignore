@@ -1,0 +1,44 @@
+# Build context for docker/Dockerfile: code only. Data, runs, caches and weights
+# never go into the image -- the payload is pulled from the Hugging Face repo at
+# first start.
+.git
+.gitignore
+.github
+.vscode
+.idea
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.hypothesis
+.cache
+**/.cache
+
+runs/
+runsPDB/
+confrover_cache/
+payloads/
+cache*/
+*output*/
+lightning_logs/
+wandb/
+logs/
+*.log
+
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz
+*.a3m
+*.xtc
+*.pdb
+*.tar
+*.tar.gz
+*.zip
+*.h5
+
+docker-compose*.yml
+examples/

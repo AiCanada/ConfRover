@@ -420,6 +420,25 @@ On the instance (repo cloned, `HF_TOKEN` exported):
 HF_REPO=<user>/<repo> bash scripts/vast_bootstrap_pdbcluster.sh          # install, download, verify, 6-step smoke
 HF_REPO=<user>/<repo> bash scripts/vast_bootstrap_pdbcluster.sh --train  # ... then train, syncing checkpoints to the Hub
 ```
+### Docker image
+
+`docker/Dockerfile` bakes the code and the bootstrap into an image on the validated
+torch 2.13 / CUDA 12.6 base; the 33 GB payload is pulled from the Hugging Face repo
+into a volume at first start, so containers are disposable and the data is not.
+
+```bash
+docker build -t aicanada/confrover-pdbcluster:latest -f docker/Dockerfile     --build-arg COMMIT=$(git rev-parse HEAD) .
+docker push aicanada/confrover-pdbcluster:latest            # any registry vast.ai can pull from
+
+docker run --gpus all --ipc=host -e HF_TOKEN=hf_... -v confrover_ws:/workspace     aicanada/confrover-pdbcluster:latest smoke               # download, verify, 6 real steps
+docker run --gpus all --ipc=host -e HF_TOKEN=hf_... -v confrover_ws:/workspace     aicanada/confrover-pdbcluster:latest train               # train; re-run to resume
+```
+or `export HF_TOKEN=... && docker compose run --rm confrover train`. Modes: `smoke`
+(default), `train`, `verify`, `shell`, or any command. Knobs are environment
+variables (`WORKERS`, `ONE_PASS`, `MAX_EPOCHS`, `TF32`, `RUN_NAME`, `HF_REPO`).
+`--ipc=host` matters: DataLoader workers hand `(L, L, 128)` tensors through
+`/dev/shm`, and Docker's default 64 MB is not enough.
+
 `scripts/stage_remote_payload.py --catalog ...` ships a catalog JSON by path (the unique
 PDB-cluster catalog merges structures across directories, so a directory scan cannot
 reproduce its fingerprint), the edited split, the original base weights and only the

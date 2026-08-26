@@ -43,7 +43,7 @@ confrover train `
   --grad_clip 1.0 `
   --accumulate_grad_batches 1 `
   --ckpt_every_n_steps 500 `
-  --val_every_n_steps 200 `
+  --val_every_n_steps 500 `
   --log_every_n_steps 10 `
   --progress_bar true `
   --resume none

@@ -1,0 +1,40 @@
+# ConfRover PDB-cluster fine-tune in a container.
+#
+#   export HF_TOKEN=hf_...
+#   docker compose run --rm confrover smoke     # download, verify, 6-step smoke
+#   docker compose run --rm confrover train     # train (resumes if stopped)
+#   docker compose run --rm confrover shell     # poke around
+#
+# The confrover_ws volume holds the 33 GB payload, the run directory and the
+# checkpoints, so `docker compose run` can be repeated (or the image rebuilt)
+# without downloading again.
+services:
+  confrover:
+    image: aicanada/confrover-pdbcluster:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      HF_TOKEN: ${HF_TOKEN:?export HF_TOKEN first}
+      HF_REPO: ${HF_REPO:-AICanada/ConfRover-PDBcluster}
+      RUN_NAME: ${RUN_NAME:-PDBcluster_from_base}
+      WORKERS: ${WORKERS:-8}
+      ONE_PASS: ${ONE_PASS:-true}
+      MAX_EPOCHS: ${MAX_EPOCHS:-3}
+      TF32: ${TF32:-0}
+    volumes:
+      - confrover_ws:/workspace
+    # DataLoader workers pass tensors through /dev/shm; the default 64 MB is
+    # far too small for (L, L, 128) pair representations.
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["smoke"]
+
+volumes:
+  confrover_ws: {}
