@@ -23,6 +23,9 @@ ARG COMMIT=unknown
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
+    # The pytorch image installs torch into Ubuntu's system Python, which PEP 668
+    # marks externally managed; inside a container that is the environment we want.
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1 \
     # Code lives outside /workspace so mounting the data volume there cannot
     # hide it. scripts/vast_bootstrap_pdbcluster.sh reads these.
