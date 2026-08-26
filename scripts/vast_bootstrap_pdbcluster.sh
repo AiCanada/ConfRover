@@ -16,8 +16,16 @@
 # download goes to $DL and $DATA is linked onto it.
 #
 # Prerequisites on the instance:
-#   - the ConfRover repo at $REPO (git clone, or scp it up -- it is small)
 #   - HF_TOKEN exported with read access to $HF_REPO (write, for the checkpoint sync)
+#   - the ConfRover code at $REPO. No GitHub needed: the payload repo also carries
+#     code/ConfRover.tar.gz (a `git archive` of the commit the payload was built
+#     with), and step 1 fetches and unpacks it when $REPO does not exist. To
+#     bootstrap from a bare container:
+#
+#       pip install -q -U huggingface_hub && export HF_TOKEN=...
+#       hf download AICanada/ConfRover-PDBcluster code/ConfRover.tar.gz --repo-type dataset --local-dir /workspace
+#       mkdir -p /workspace/ConfRover && tar -xzf /workspace/code/ConfRover.tar.gz -C /workspace/ConfRover
+#       HF_REPO=AICanada/ConfRover-PDBcluster bash /workspace/ConfRover/scripts/vast_bootstrap_pdbcluster.sh
 #
 # Usage:  HF_REPO=AICanada/ConfRover-PDBcluster bash scripts/vast_bootstrap_pdbcluster.sh [--train]
 #         Without --train it stops after the smoke run, when the per-step cost on this
@@ -72,9 +80,16 @@ if [[ "$TF32" == "1" ]]; then
 fi
 echo "run=$RUN_NAME  workers=$WORKERS  one_pass=$ONE_PASS  max_epochs=$MAX_EPOCHS  tf32=$TF32"
 echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
-cd "$REPO"
-pip install -q -e .
 pip install -q "huggingface_hub>=0.23"
+if [[ ! -f "$REPO/pyproject.toml" ]]; then
+  echo "no checkout at $REPO; fetching code/ConfRover.tar.gz from $HF_REPO"
+  hf download "$HF_REPO" code/ConfRover.tar.gz --repo-type dataset --local-dir "$DL"
+  mkdir -p "$REPO"
+  tar -xzf "$DL/code/ConfRover.tar.gz" -C "$REPO"
+fi
+cd "$REPO"
+[[ -f COMMIT ]] && echo "code commit: $(cat COMMIT)"
+pip install -q -e .
 
 say "2/6  download payload $HF_REPO/${HF_SUBDIR:-<root>}"
 # Resumable: re-running skips what is already local. checkpoints/* is excluded: that
