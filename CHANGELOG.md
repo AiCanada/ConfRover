@@ -89,6 +89,13 @@ Local DPF fine-tune work on top of official ConfRover v1.0 (inference-only).
 
 ### Fixed
 
+- **One oversized batch no longer ends the run.** `PDBcluster_from_base` died at
+  step ~25 (no checkpoint yet) when a 9-frame forward window OOM'd in the
+  pairformer attention. `training_step`/`validation_step` now drop a batch on
+  CUDA out-of-memory (both the allocator's `OutOfMemoryError` and the kernel-
+  side `AcceleratorError: CUDA error: out of memory`), log its family / L /
+  frames, and continue; `--max_oom_skips` (default 20) bounds the total and more
+  than 5 in a row aborts.
 - The TFLOP probe measured the single-target batch whatever `--window_frames`
   was, so a W=9 run reported about a ninth of a real step and explained the
   forward/iid ratio with "two source frames". It now builds the window batch

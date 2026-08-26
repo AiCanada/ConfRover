@@ -51,7 +51,7 @@ from confrover.data.dpf.manifest import export_heldout_manifest, write_heldout_m
 from confrover.data.pretrain_repr.openfold.loader import OpenFoldReprLoader
 from confrover.env import CachePaths
 from confrover.model.decoder.confdiff.loss import ConfDiffLoss
-from confrover.model.train import ConfRoverTrain
+from confrover.model.train import DEFAULT_MAX_OOM_SKIPS, ConfRoverTrain
 from confrover.data.dpf.examples import (
     DEFAULT_FORWARD_STRIDE_FRAMES,
     DEFAULT_IID_FRAME_STRIDE,
@@ -1544,6 +1544,7 @@ def run_train(args: argparse.Namespace) -> None:
         lr_schedule=args.lr_schedule,
         lr_warmup_steps=args.lr_warmup_steps,
         lr_min_ratio=args.lr_min_ratio,
+        max_oom_skips=max(0, int(args.max_oom_skips)),
     )
 
     datamodule = ConfRoverDataModule(
@@ -1964,6 +1965,16 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "against the GPU; set 0 only when debugging.",
     )
     fit.add_argument("--precision", type=str, default="32-true")
+    fit.add_argument(
+        "--max_oom_skips",
+        type=int,
+        default=DEFAULT_MAX_OOM_SKIPS,
+        metavar="N",
+        help="Batches the run may drop on CUDA out-of-memory (forward pass) before "
+        "it fails; each is logged with its family and L. More than 5 in a row "
+        "aborts regardless (dead context / nothing fits). 0 = fail on the first "
+        "OOM.",
+    )
     fit.add_argument(
         "--progress_bar",
         type=str2bool,
