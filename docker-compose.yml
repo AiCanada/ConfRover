@@ -1,4 +1,4 @@
-# ConfRover PDB-cluster fine-tune in a container.
+# ConfRover PDB-cluster fine-tune in a container, for a rented RTX PRO 6000 (Blackwell).
 #
 #   export HF_TOKEN=hf_...
 #   docker compose run --rm confrover smoke     # download, verify, 6-step smoke

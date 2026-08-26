@@ -32,16 +32,22 @@ def test_dockerfile_wires_the_entrypoint_to_the_bootstrap():
     assert "HF_REPO=AICanada/ConfRover-PDBcluster" in text
     entry = ENTRYPOINT.read_text(encoding="utf-8")
     assert "vast_bootstrap_pdbcluster.sh" in entry
-    for mode in ("smoke)", "train)", "verify)", "shell|bash)"):
+    for mode in ("smoke)", "train)", "verify)", "gpu)", "shell|bash)"):
         assert mode in entry, mode
     assert "HF_TOKEN" in entry
 
 
-def test_base_image_matches_the_validated_stack():
+def test_base_image_has_blackwell_kernels():
+    """The target is an RTX PRO 6000 (sm_120). torch's cu126 wheels stop at sm_90,
+    so the base must be a CUDA >= 12.8 build of the validated torch line."""
     text = DOCKERFILE.read_text(encoding="utf-8")
-    match = re.search(r"ARG BASE=pytorch/pytorch:(\d+\.\d+)\.\d+-cuda(12\.\d)-cudnn9-runtime", text)
+    match = re.search(r"ARG BASE=pytorch/pytorch:(\d+\.\d+)\.\d+-cuda(\d+)\.(\d+)-cudnn9-runtime", text)
     assert match, "base image must be an official pytorch runtime tag"
-    assert match.group(1) == "2.13" and match.group(2) == "12.6"
+    assert match.group(1) == "2.13"
+    cuda = (int(match.group(2)), int(match.group(3)))
+    assert cuda >= (12, 8), f"CUDA {cuda} has no sm_120 kernels"
+    entry = ENTRYPOINT.read_text(encoding="utf-8")
+    assert "gpu_preflight" in entry and "get_arch_list" in entry
 
 
 def test_build_context_excludes_data_runs_and_weights():

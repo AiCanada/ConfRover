@@ -422,8 +422,9 @@ HF_REPO=<user>/<repo> bash scripts/vast_bootstrap_pdbcluster.sh --train  # ... t
 ```
 ### Docker image
 
-`docker/Dockerfile` bakes the code and the bootstrap into an image on the validated
-torch 2.13 / CUDA 12.6 base; the 33 GB payload is pulled from the Hugging Face repo
+`docker/Dockerfile` bakes the code and the bootstrap into an image for the rented
+RTX PRO 6000 (Blackwell, sm_120): torch 2.13 on the CUDA 13.0 base — the CUDA 12.6
+build has no sm_120 kernels — with a GPU preflight in the entrypoint; the 33 GB payload is pulled from the Hugging Face repo
 into a volume at first start, so containers are disposable and the data is not.
 
 ```bash

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Container entrypoint for the PDB-cluster cloud run.
+# Container entrypoint for the PDB-cluster cloud run (RTX PRO 6000 / Blackwell).
 #
 #   smoke   download the payload, verify it, run 6 real steps, stop      (default)
 #   train   the same, then train; the same command resumes after a stop
 #   verify  download + verify only (no GPU time)
+#   gpu     GPU preflight only: driver, device, capability vs torch's kernels
 #   shell   an interactive shell in the container
 #   <cmd>   anything else is exec'd as-is (e.g. `confrover train --help`)
 #
@@ -24,14 +25,42 @@ need_token() {
   fi
 }
 
+# Fail in seconds, not after a 33 GB download: the card's compute capability must
+# be one torch has kernels for. A cu126 build stops at sm_90; Blackwell is sm_120.
+gpu_preflight() {
+  python - <<'PY'
+import sys, torch
+if not torch.cuda.is_available():
+    sys.exit("no CUDA device visible: run with --gpus all (and the NVIDIA container toolkit installed)")
+name = torch.cuda.get_device_name(0)
+major, minor = torch.cuda.get_device_capability(0)
+archs = torch.cuda.get_arch_list()
+free, total = torch.cuda.mem_get_info()
+print(f"gpu: {name}  sm_{major}{minor}  {total/2**30:.0f} GiB ({free/2**30:.0f} free)")
+print(f"torch {torch.__version__}  cuda {torch.version.cuda}  kernels for: {', '.join(archs)}")
+if f"sm_{major}{minor}" not in archs and f"compute_{major}{minor}" not in archs:
+    sys.exit(f"torch in this image has no kernels for sm_{major}{minor}; rebuild with a CUDA "
+             f"{'13.0' if major >= 10 else '12.x'} base (see docker/Dockerfile ARG BASE)")
+torch.ones(1, device="cuda").mul_(2)
+torch.cuda.synchronize()
+print("gpu preflight ok")
+PY
+}
+
 case "$MODE" in
   smoke)
     need_token
+    gpu_preflight
     exec bash "$BOOT"
     ;;
   train)
     need_token
+    gpu_preflight
     exec bash "$BOOT" --train
+    ;;
+  gpu)
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader || true
+    gpu_preflight
     ;;
   verify)
     need_token
