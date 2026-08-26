@@ -93,35 +93,6 @@ def lr_scale(
     return min_ratio + (1.0 - min_ratio) * cosine
 
 
-#: Batches a run may drop on CUDA out-of-memory before it gives up. One
-#: oversized 9-frame window killed a run 25 steps in (no checkpoint yet); the
-#: rest of the corpus fits. 0 = fail on the first OOM, as before.
-DEFAULT_MAX_OOM_SKIPS = 20
-#: OOMs in a row that mean the context is dead or nothing fits, not one outlier.
-MAX_CONSECUTIVE_OOM = 5
-
-
-def _is_out_of_memory(exc: BaseException) -> bool:
-    """CUDA OOM in any of the forms torch raises it.
-
-    ``torch.OutOfMemoryError`` is the allocator's; a kernel or cuBLAS workspace
-    that cannot be served raises ``AcceleratorError: CUDA error: out of memory``
-    (cudaErrorMemoryAllocation), which is what the pairformer attention hit.
-    """
-    types = tuple(
-        t
-        for t in (
-            getattr(torch, "OutOfMemoryError", None),
-            getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None),
-        )
-        if isinstance(t, type)
-    )
-    if types and isinstance(exc, types):
-        return True
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return "out of memory" in text or "cudaerrormemoryallocation" in text
-
-
 class ConfRoverTrain(ConfRover):
     """Fine-tune ConfRover-base-20M on DPF iid / forward samples."""
 
@@ -141,7 +112,6 @@ class ConfRoverTrain(ConfRover):
         lr_schedule: LRScheduleName = DEFAULT_LR_SCHEDULE,
         lr_warmup_steps: int = DEFAULT_LR_WARMUP_STEPS,
         lr_min_ratio: float = DEFAULT_LR_MIN_RATIO,
-        max_oom_skips: int = DEFAULT_MAX_OOM_SKIPS,
         **kwargs,
     ):
         super().__init__(
@@ -164,9 +134,6 @@ class ConfRoverTrain(ConfRover):
         self.lr_schedule = lr_schedule
         self.lr_warmup_steps = int(lr_warmup_steps)
         self.lr_min_ratio = float(lr_min_ratio)
-        self.max_oom_skips = int(max_oom_skips)
-        self.oom_skipped = 0
-        self._oom_consecutive = 0
 
     @classmethod
     def from_base_checkpoint(
@@ -185,7 +152,6 @@ class ConfRoverTrain(ConfRover):
         lr_schedule: LRScheduleName = DEFAULT_LR_SCHEDULE,
         lr_warmup_steps: int = DEFAULT_LR_WARMUP_STEPS,
         lr_min_ratio: float = DEFAULT_LR_MIN_RATIO,
-        max_oom_skips: int = DEFAULT_MAX_OOM_SKIPS,
     ) -> "ConfRoverTrain":
         assert_base_weight_family(pretrained_model)
         from pathlib import Path
@@ -236,7 +202,6 @@ class ConfRoverTrain(ConfRover):
             lr_schedule=lr_schedule,
             lr_warmup_steps=lr_warmup_steps,
             lr_min_ratio=lr_min_ratio,
-            max_oom_skips=max_oom_skips,
         )
         model.export_model_cfg = model_ckpt["model_cfg"]
         model.decoder.loss = loss if loss is not None else ConfDiffLoss()
@@ -508,65 +473,14 @@ class ConfRoverTrain(ConfRover):
                     return max(int(estimated_f), 1)
         return max(int(self.lr_warmup_steps), 1)
 
-    def training_step(self, batch: dict[str, Any], batch_idx: int):
-        output = self._guarded_step(batch, batch_idx, stage="train")
-        if output is None:
-            return None  # Lightning skips the optimizer step for this batch
+    def training_step(self, batch: dict[str, Any], batch_idx: int) -> dict[str, Any]:
+        output = self._step(batch, batch_idx=batch_idx)
         self._log_step(output, stage="train", batch=batch)
         return output
 
-    def validation_step(self, batch: dict[str, Any], batch_idx: int):
-        output = self._guarded_step(batch, batch_idx, stage="val")
-        if output is None:
-            return None
+    def validation_step(self, batch: dict[str, Any], batch_idx: int) -> dict[str, Any]:
+        output = self._step(batch, batch_idx=batch_idx)
         self._log_step(output, stage="val", batch=batch)
-        return output
-
-    def _guarded_step(self, batch: dict[str, Any], batch_idx: int, stage: str):
-        """``_step``, dropping the batch on CUDA OOM instead of ending the run.
-
-        A batch that does not fit is a property of that protein (L, frames), not
-        of the run: one oversized 9-frame window ended a run 25 steps in with no
-        checkpoint written, while every other batch had been fitting. Skipping
-        it costs one example; raising costs the run. The budget is bounded twice:
-        ``max_oom_skips`` in total, and ``MAX_CONSECUTIVE_OOM`` in a row, which
-        is what a dead context or a corpus that never fits looks like. Backward
-        OOMs are not caught here -- Lightning runs backward outside this hook.
-        """
-        try:
-            output = self._step(batch, batch_idx=batch_idx)
-        except Exception as exc:  # noqa: BLE001 - re-raised unless it is an OOM
-            if self.max_oom_skips <= 0 or not _is_out_of_memory(exc):
-                raise
-            self.oom_skipped += 1
-            self._oom_consecutive += 1
-            infos = batch.get("job_info") or [{}]
-            families = sorted({str(i.get("family_id")) for i in infos if isinstance(i, dict)})
-            seqlen = int(batch["aatype"].shape[1]) if "aatype" in batch else -1
-            frames = int(batch.get("num_frames", 1) or 1)
-            log.warning(
-                "CUDA out of memory on %s batch %d (%s, L=%d, %d frames, %s): "
-                "skipping it. %d/%d skips used, %d in a row. %s: %s",
-                stage, batch_idx, ",".join(families) or "?", seqlen, frames,
-                batch.get("task_mode", "?"), self.oom_skipped, self.max_oom_skips,
-                self._oom_consecutive, type(exc).__name__, str(exc).splitlines()[0][:120],
-            )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            if self._oom_consecutive > MAX_CONSECUTIVE_OOM:
-                raise RuntimeError(
-                    f"{self._oom_consecutive} consecutive CUDA out-of-memory "
-                    "batches: the context is dead or nothing in this corpus fits "
-                    "on this card at these settings (--window_frames, --max_seqlen)."
-                ) from exc
-            if self.oom_skipped > self.max_oom_skips:
-                raise RuntimeError(
-                    f"{self.oom_skipped} batches dropped on CUDA out of memory, over "
-                    f"the --max_oom_skips {self.max_oom_skips} budget. Lower "
-                    "--max_seqlen or --window_frames, or raise the budget."
-                ) from exc
-            return None
-        self._oom_consecutive = 0
         return output
 
     def _log_step(self, output: dict[str, Any], stage: str, batch) -> None:

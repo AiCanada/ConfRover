@@ -20,13 +20,6 @@
 # continuation (train=1,442 / val=168 / test=68); the --*_frac values are its
 # realised fractions and must match it or DpfSplit.load refuses the file.
 #
-# On the 8 GB laptop card this configuration runs in the Windows CUDA host-memory
-# fallback (mem=20/27G reserved, ~45 s/step at L=130) and died at step ~25 when a
-# long 9-frame window could not be served at all (CUDA out of memory in the
-# pairformer attention). Batches that do not fit are now skipped (--max_oom_skips,
-# default 20); the intended home for this run is the rented GPU
-# (scripts/vast_bootstrap_pdbcluster.sh).
-#
 # --window_frames 9: each example is 9 distinct structures of one cluster; the
 # temporal module gets 9 tokens and every token predicts its own frame. With
 # --one_pass_frames the corpus is consumed in ~1 epoch (about 7,900 steps);
