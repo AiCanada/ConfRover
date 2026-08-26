@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -28,34 +28,17 @@ import numpy as np
 import pandas as pd
 import torch
 from omegaconf import DictConfig
-from openfold.data import data_transforms
-from openfold.np import residue_constants as rc
-from openfold.utils import rigid_utils as ru
+from confrover._ext.openfold.np import residue_constants as rc
+from confrover._ext.openfold.utils import rigid_utils as ru
 from torch.nn.utils.rnn import pad_sequence
 
 from confrover.utils import PathLike, get_pylogger
 from confrover.utils.torch.tensor import rearrange
 
+from .coords import atom37_to_openfold_feat
 from .io.pdb import pdb_to_atom37
 from .io.xtc import xtc_to_atom37
-
-
-@dataclass
-class LoaderConfig:
-    """Additional configuration for torch.DataLoader"""
-
-    batch_size: int | None = None
-    num_workers: int | None = None
-    pin_memory: bool | None = None
-    shuffle: bool | None = None
-
-    def to_dict(self, drop_none: bool = True):
-        obj_dict = asdict(self)
-        if drop_none:
-            return {k: v for k, v in obj_dict.items() if v is not None}
-        else:
-            return obj_dict
-
+from .loader_config import LoaderConfig
 
 logger = get_pylogger(__name__)
 
@@ -455,31 +438,7 @@ class GenDataset(torch.utils.data.Dataset):
 
     def process_coords(self, atom_coords, aatype):
         """Process atom37 coordinates with AF2/OpenFold pipeline"""
-        all_atom_positions = torch.from_numpy(atom_coords)  # (..., L, 37, 3)
-        all_atom_mask = torch.all(
-            ~torch.isnan(all_atom_positions), dim=-1
-        )  # (..., L, 37)
-
-        all_atom_positions = torch.nan_to_num(
-            all_atom_positions, 0.0
-        )  # convert NaN to zero
-
-        # OpenFold data transformation
-        openfold_feat_dict = {
-            "aatype": aatype.long(),
-            "all_atom_positions": all_atom_positions.double(),
-            "all_atom_mask": all_atom_mask.double(),
-        }
-
-        openfold_feat_dict = data_transforms.atom37_to_frames(openfold_feat_dict)
-        openfold_feat_dict = data_transforms.make_atom14_masks(openfold_feat_dict)
-        openfold_feat_dict = data_transforms.make_atom14_positions(openfold_feat_dict)
-        openfold_feat_dict = data_transforms.atom37_to_torsion_angles("")(
-            openfold_feat_dict
-        )
-        openfold_feat_dict = data_transforms.make_pseudo_beta("")(openfold_feat_dict)
-
-        return openfold_feat_dict
+        return atom37_to_openfold_feat(atom_coords, aatype)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         case_cfg = self.cfg.cases[idx]

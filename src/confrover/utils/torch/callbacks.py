@@ -19,6 +19,7 @@
 # =============================================================================
 from __future__ import annotations
 
+import math
 from time import perf_counter
 from typing import Any, Optional
 
@@ -63,6 +64,52 @@ METRIC_TYPE_MAPPER = {
 # =============================================================================
 # Classes
 # =============================================================================
+
+
+def _agree(flag: bool) -> bool:
+    """AND ``flag`` across ranks. Identity when not running distributed.
+
+    Used so a per-rank decision cannot make participation in a collective
+    asymmetric. Deliberately swallows every failure: a metrics helper that
+    raises mid-epoch takes the run down, while a wrong display value does not.
+    """
+    try:
+        import torch
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return flag
+        tensor = torch.tensor([1.0 if flag else 0.0])
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            tensor = tensor.cuda()
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+        return bool(tensor.item() > 0)
+    except Exception:  # noqa: BLE001 - see docstring
+        return flag
+
+
+def _metric_field(pl_module, log_name: str, metric: str, value, fmt: str) -> str:
+    """Log and format one metric, or report n/a rather than printing a nan.
+
+    A weighted MeanMetric (the gate-weighted atom14 term) computes 0/0 when
+    every step in the window was gated off. Printing that as `nan` reads like a
+    diverged loss, and logging it puts a nan in callback_metrics where a
+    checkpoint monitor would compare against it -- so an unsupervised term is
+    reported as absent, which is what it is.
+    """
+    try:
+        finite = math.isfinite(float(value))
+    except (TypeError, ValueError):
+        finite = False
+    # `sync_dist=True` enters a collective, so whether to log cannot be decided
+    # per rank: a rank whose window was fully gated would return early while its
+    # peers block in the all-reduce, and the job hangs until the NCCL watchdog
+    # fires. Agree first -- either every rank logs, or none does.
+    finite = _agree(finite)
+    if not finite:
+        return f", {metric}: n/a"
+    pl_module.log(log_name, value, sync_dist=True)
+    return f", {metric}: {fmt.format(value)}"
 
 
 class MetricsHandler(Callback):
@@ -216,19 +263,34 @@ class MetricsHandler(Callback):
     def on_validation_epoch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule
     ) -> None:
+        # Lightning runs a validation pass before the first training batch, so
+        # every train metric is empty there: computing it warns and yields nan,
+        # and logging that nan puts a nan in callback_metrics that a checkpoint
+        # monitor would then compare against. Report the val side only.
+        # Agreed across ranks for the same reason as in _metric_field: this flag
+        # gates `sync_dist=True` logs, so one rank answering differently leaves
+        # its peers blocked in an all-reduce nobody else joins.
+        train_seen = _agree(
+            bool(getattr(pl_module.train_loss, "update_called", True))
+        )
+
         # Log basic metrics
-        train_loss = pl_module.train_loss.compute()
         val_loss = pl_module.val_loss.compute()
         pl_module.val_best_loss.update(val_loss)
-        pl_module.log("train/loss", train_loss, sync_dist=True)
         pl_module.log("val/loss", val_loss, sync_dist=True)
         pl_module.log(
             "val/best_loss", pl_module.val_best_loss.compute(), sync_dist=True
         )
 
-        train_report_str = (
-            f"[Train set] loss: {self.metrics_info['loss']['fmt'].format(train_loss)}"
-        )
+        if train_seen:
+            train_loss = pl_module.train_loss.compute()
+            pl_module.log("train/loss", train_loss, sync_dist=True)
+            train_report_str = (
+                "[Train set] loss: "
+                f"{self.metrics_info['loss']['fmt'].format(train_loss)}"
+            )
+        else:
+            train_report_str = "[Train set] no batches yet (pre-training validation)"
         val_report_str = (
             f"[Val set]   loss: {self.metrics_info['loss']['fmt'].format(val_loss)}"
         )
@@ -240,19 +302,19 @@ class MetricsHandler(Callback):
             if metric in ["loss", "best_loss"]:
                 continue
 
-            if cfg["train"]:
+            if cfg["train"] and train_seen:
                 metric_val = getattr(pl_module, f"train_{metric}").compute()
-                wandb_name = cfg["wandb_name"]
-                fmt = cfg["fmt"]
-                pl_module.log(f"train/{wandb_name}", metric_val, sync_dist=True)
-                train_report_str += f", {metric}: {fmt.format(metric_val)}"
+                train_report_str += _metric_field(
+                    pl_module, f"train/{cfg['wandb_name']}", metric, metric_val,
+                    cfg["fmt"],
+                )
 
             if cfg["val"]:
                 metric_val = getattr(pl_module, f"val_{metric}").compute()
-                wandb_name = cfg["wandb_name"]
-                fmt = cfg["fmt"]
-                pl_module.log(f"val/{wandb_name}", metric_val, sync_dist=True)
-                val_report_str += f", {metric}: {fmt.format(metric_val)}"
+                val_report_str += _metric_field(
+                    pl_module, f"val/{cfg['wandb_name']}", metric, metric_val,
+                    cfg["fmt"],
+                )
 
         # print to console
         logger.info(

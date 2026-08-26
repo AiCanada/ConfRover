@@ -30,8 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from einops import rearrange
-from openfold.utils import rigid_utils as ru
-from openfold.utils.precision_utils import is_fp16_enabled
+from confrover._ext.openfold.utils import rigid_utils as ru
+from confrover._ext.openfold.utils.precision_utils import is_fp16_enabled
 from scipy.spatial.transform import Rotation as R
 from scipy.stats import truncnorm
 from torch import nn
@@ -317,8 +317,12 @@ class InvariantPointAttention(nn.Module):
             offload_to_cpu=True,
         )
 
-        self.softmax = checkpoint_wrapper(nn.Softmax(dim=-1), offload_to_cpu=True)
-        self.softplus = checkpoint_wrapper(nn.Softplus(), offload_to_cpu=True)
+        # Not checkpoint_wrapped: measured to save exactly 0 bytes of peak
+        # allocated (parameterless, and softplus' only input is the 8-element
+        # head_weights above), while each one costs an autograd.Function
+        # boundary, an RNG snapshot, and one more silent-freeze trap.
+        self.softmax = nn.Softmax(dim=-1)
+        self.softplus = nn.Softplus()
 
     def forward(
         self,
@@ -407,7 +411,7 @@ class InvariantPointAttention(nn.Module):
         # )
 
         if is_fp16_enabled():
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 a = torch.matmul(
                     permute_final_dims(q.float(), (1, 0, 2)),  # [*, H, N_res, C_hidden]
                     permute_final_dims(k.float(), (1, 2, 0)),  # [*, H, C_hidden, N_res]
@@ -687,7 +691,20 @@ class StructureModule(nn.Module):
                 norm_first=False,
             )
             self.trunk[f"seq_tfmr_{b}"] = checkpoint_wrapper(
-                torch.nn.TransformerEncoder(tfmr_layer, seq_tfmr_num_layers),
+                torch.nn.TransformerEncoder(
+                    tfmr_layer,
+                    seq_tfmr_num_layers,
+                    # This encoder is always called with src_key_padding_mask, so
+                    # the default enable_nested_tensor=True sends inference (but
+                    # not training -- the fast path bails when grad is enabled)
+                    # through torch._nested_tensor_from_mask, which warns on every
+                    # call that the nested-tensor API is prototype and will change.
+                    # The path exists to skip padded positions; ConfRover samples
+                    # and validates at batch_size=1, where there is no padding to
+                    # skip, so it buys nothing here and its output is discarded by
+                    # the same mask either way.
+                    enable_nested_tensor=False,
+                ),
                 offload_to_cpu=True,
             )
             self.trunk[f"post_tfmr_{b}"] = checkpoint_wrapper(

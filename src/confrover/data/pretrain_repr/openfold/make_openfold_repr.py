@@ -22,23 +22,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
+import sys
 from pathlib import Path, PosixPath
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
-from openfold.config import model_config
-from openfold.data.data_pipeline import DataPipeline, make_sequence_features
-from openfold.data.feature_pipeline import FeaturePipeline
-from openfold.np import protein
-from openfold.utils.import_weights import import_openfold_weights_
-from openfold.utils.script_utils import prep_output
-from openfold.utils.tensor_utils import tensor_tree_map
+from confrover._ext.openfold.config import model_config
+from confrover._ext.openfold.data.data_pipeline import DataPipeline, make_sequence_features
+from confrover._ext.openfold.data.feature_pipeline import FeaturePipeline
+from confrover._ext.openfold.np import protein
+from confrover._ext.openfold.utils.import_weights import import_openfold_weights_
+from confrover._ext.openfold.utils.script_utils import prep_output
+from confrover._ext.openfold.utils.tensor_utils import tensor_tree_map
 from tqdm import tqdm
 
 from confrover.data.msa import MSALoader
+from confrover.data.msa.mmseq2_colab import _a3m_query
 from confrover.data.msa.msa_loader import _load_seqres_index_pairs
 from confrover.data.pretrain_repr.openfold.openfold_model import AlphaFold
 from confrover.data.pretrain_repr.openfold.utils import download_openfold_params
@@ -62,6 +65,118 @@ else:
 
 
 DEFAULT_PATH = CachePaths()
+_IN_PROGRESS_NAME = "openfold_repr_in_progress.txt"
+_FAILED_NAME = "openfold_repr_failed.csv"
+
+
+def _is_recoverable_cuda_error(exc: BaseException) -> bool:
+    """True when the GPU context may be poisoned and a skip/restart is safer.
+
+    Windows WDDM often surfaces OOM as CUBLAS / illegal-access / 'unknown
+    error' rather than the string 'out of memory', so a narrow match lets a
+    6-hour `openfold_repr` die in tqdm after chunk-size tuning.
+    """
+    if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())):
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        token in text
+        for token in (
+            "out of memory",
+            "illegal memory",
+            "cudaerror",
+            "acceleratorerror",
+            "cublas",
+            "unspecified launch failure",
+            "device-side assert",
+            "cuda driver error",
+            "an illegal instruction was encountered",
+        )
+    )
+
+
+def _write_in_progress(output_root: PathLike, seqres: str, index: str) -> None:
+    path = Path(output_root) / _IN_PROGRESS_NAME
+    path.write_text(f"{index}\t{len(seqres)}\n", encoding="utf-8")
+
+
+def _clear_in_progress(output_root: PathLike) -> None:
+    path = Path(output_root) / _IN_PROGRESS_NAME
+    if path.exists():
+        path.unlink()
+
+
+#: Exit code for "stopped early, rerun the same command to continue". Anything
+#: nonzero stops a wrapper from treating a partial store as a finished one;
+#: EX_TEMPFAIL is the conventional "temporary failure, retry" value.
+_EXIT_RESUMABLE = 75
+
+#: On-disk index contents, per index file, so the per-success write below does
+#: not re-read a growing CSV once per protein.
+_INDEX_CACHE: dict[Path, dict[str, str]] = {}
+
+
+def _assert_msa_matches(msa_dir: Path, index: str, seqres: str) -> None:
+    """Refuse to build a representation from another protein's alignment.
+
+    A family id is not a stable name for a sequence: rebuilding a cluster with a
+    different admit cap or RMSD gate changes which structures it holds and so
+    which sequence represents it, while the a3m cached under that id stays put.
+    Generating anyway produces a well-formed tensor of exactly the right shape
+    that encodes the wrong protein -- unfalsifiable from the outputs alone, and
+    expensive to discover once it is in a training corpus.
+    """
+    a3m = msa_dir / "a3m" / f"{index}.a3m"
+    query = _a3m_query(a3m)
+    if query is None:
+        raise FileNotFoundError(f"{index}: no readable alignment at {a3m}")
+    if query != seqres.upper():
+        raise ValueError(
+            f"{index}: the alignment at {a3m} is for a different sequence "
+            f"(len {len(query)} vs the requested {len(seqres)}). Re-query the "
+            f"MSA for this family before generating its representation."
+        )
+
+
+def _persist_index(output_root: PathLike, updates: dict[str, str]) -> None:
+    """Merge ``updates`` into seqres_to_index.csv and swap it in atomically.
+
+    Called after every success so a crash can resume, which is why the on-disk
+    contents are read once and then kept in memory: re-reading and re-writing a
+    growing CSV per protein is quadratic over a run this module already warns
+    takes hours.
+
+    ``to_csv`` truncates in place, so a crash part-way through the write leaves
+    a half-written index that the next run parses as authoritative -- every
+    family missing from it silently regenerates. Writing a temp file and
+    ``os.replace``-ing it makes the swap all-or-nothing.
+    """
+    index_file = Path(output_root) / "seqres_to_index.csv"
+    cached = _INDEX_CACHE.get(index_file)
+    if cached is None:
+        cached = {}
+        if index_file.exists():
+            try:
+                cached = (
+                    pd.read_csv(index_file).set_index("seqres")["index"].to_dict()
+                )
+            except Exception:
+                cached = {}
+        _INDEX_CACHE[index_file] = cached
+    cached.update(updates)
+    tmp = index_file.with_name(index_file.name + ".tmp")
+    pd.DataFrame(cached.items(), columns=["seqres", "index"]).to_csv(tmp, index=False)
+    os.replace(tmp, index_file)
+
+
+def _append_failed(output_root: PathLike, seqres: str, index: str, reason: str) -> None:
+    path = Path(output_root) / _FAILED_NAME
+    write_header = not path.exists()
+    with path.open("a", encoding="utf-8") as handle:
+        if write_header:
+            handle.write("seqres,index,reason\n")
+        safe_reason = reason.replace(",", ";").replace("\n", " ")
+        handle.write(f"{seqres},{index},{safe_reason}\n")
 
 
 # =============================================================================
@@ -98,6 +213,13 @@ def get_openfold_model(
     if isinstance(device, str):
         device = torch.device(device)
     af2_config = model_config(model_type, train=False, low_prec=False)
+    # Binary-searching chunk sizes runs a full evoformer per candidate. On an
+    # 8 GB laptop that is hours of "Tuning chunk size..." and often poisons
+    # CUDA. Fixed small chunks; slower per-layer, finishes the protein.
+    af2_config.globals.chunk_size = 4
+    af2_config.model.evoformer_stack.tune_chunk_size = False
+    af2_config.model.extra_msa.extra_msa_stack.tune_chunk_size = False
+    af2_config.model.template.template_pair_stack.tune_chunk_size = False
     model = AlphaFold(af2_config).to(device=device)
     model = model.eval()
 
@@ -183,6 +305,13 @@ def generate_openfold_repr(
     )
 
     msa_dir, index = msa_loader.seqres_to_dir(seqres)  # update index from MSA
+    # Everything up to here is name resolution: seqres -> index -> directory.
+    # Nothing has yet compared the alignment against the protein it is supposed
+    # to describe, and the model happily consumes a mismatched one -- the output
+    # is always len(seqres) whatever MSA it read, so a representation built from
+    # another family's alignment is indistinguishable afterwards, in the npy or
+    # in the meta. This is the last point where it is still detectable.
+    _assert_msa_matches(Path(msa_dir), index, seqres)
     msa_features = data_pipeline._process_msa_feats(
         f"{msa_dir}/a3m", seqres, alignment_index=None
     )
@@ -190,21 +319,30 @@ def generate_openfold_repr(
     processed_feature_dict = feature_pipeline.process_features(
         feature_dict, mode="predict"
     )
-    processed_feature_dict = {
-        k: torch.as_tensor(v, device=device) for k, v in processed_feature_dict.items()
-    }
 
     try:
+        processed_feature_dict = {
+            k: torch.as_tensor(v, device=device)
+            for k, v in processed_feature_dict.items()
+        }
         with torch.no_grad():
             out = model(processed_feature_dict)
             single_repr, pair_repr = out["evo_single"], out["evo_pair"]
     except Exception as e:
-        if "out of memory" in str(e):
+        message = str(e).lower()
+        if "out of memory" in message:
             logger.warning(
                 f"[{device}] CUDA OOM, skipping {index} (seqlen: {len(seqres)})"
-            )  # raise warning because usually index should be updated by msa_loader
-            torch.cuda.empty_cache()
-        return None, None
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return None, None
+        if _is_recoverable_cuda_error(e):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # Context is dead; caller must persist and exit for a fresh process.
+            raise
+        raise
 
     single_repr = single_repr.cpu().numpy()
     pair_repr = pair_repr.cpu().numpy()
@@ -218,7 +356,7 @@ def generate_openfold_repr(
     else:
         repr_output_dir = Path(folding_repr) / index[:2] / index
     if repr_output_dir.exists():
-        new_index = unique_dir(repr_output_dir).stem
+        new_index = unique_dir(repr_output_dir).name
         if v1:
             new_repr_output_dir = Path(folding_repr) / new_index
         else:
@@ -444,24 +582,67 @@ def dump_repr(
         feature_pipeline = _get_feature_pipeline(num_recycles, model_type="model_3_ptm")
         msa_loader = MSALoader(msa_root)
 
+        # Short proteins first so a long-sequence CUDA death does not block the rest.
+        seqres_index_pairs = sorted(seqres_index_pairs, key=lambda pair: len(pair[0]))
         for seqres, index in tqdm(seqres_index_pairs):
-            seqres, index = generate_openfold_repr(
-                index=index,
-                seqres=seqres,
-                folding_repr=output_root,
-                msa_loader=msa_loader,
-                model=model,
-                num_recycles=num_recycles,
-                data_pipeline=data_pipeline,
-                feature_pipeline=feature_pipeline,
-                save_struct=save_struct,
-                device=_DEFAULT_DEVICE,
-                v1=v1,
-            )
-            if seqres is None and index is None:
+            _write_in_progress(output_root, seqres, index)
+            try:
+                out_seqres, out_index = generate_openfold_repr(
+                    index=index,
+                    seqres=seqres,
+                    folding_repr=output_root,
+                    msa_loader=msa_loader,
+                    model=model,
+                    num_recycles=num_recycles,
+                    data_pipeline=data_pipeline,
+                    feature_pipeline=feature_pipeline,
+                    save_struct=save_struct,
+                    device=_DEFAULT_DEVICE,
+                    v1=v1,
+                )
+            except Exception as exc:
+                if not _is_recoverable_cuda_error(exc):
+                    raise
+                logger.warning(
+                    "CUDA error on %s (seqlen=%d): %s: %s. "
+                    "Skipping this protein; cached npy files are kept.",
+                    index,
+                    len(seqres),
+                    type(exc).__name__,
+                    exc,
+                )
+                _append_failed(output_root, seqres, index, type(exc).__name__)
                 failed.append((seqres, index))
+                poisoned = True
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        poisoned = False
+                    except Exception:
+                        poisoned = True
+                if poisoned:
+                    logger.warning(
+                        "CUDA context is dead after %s. Exiting %d (EX_TEMPFAIL) "
+                        "so the same `confrover openfold_repr` command can resume "
+                        "from disk. Exit 0 would tell a wrapper the run finished "
+                        "and let it move on to training against a partial store.",
+                        index,
+                        _EXIT_RESUMABLE,
+                    )
+                    _clear_in_progress(output_root)
+                    raise SystemExit(_EXIT_RESUMABLE) from None
+                continue
+            if out_seqres is None and out_index is None:
+                failed.append((seqres, index))
+                _append_failed(output_root, seqres, index, "skipped")
             else:
-                seqres_to_index[seqres] = index
+                seqres_to_index[out_seqres] = out_index
+                # Persist after each success so a crash can resume.
+                _persist_index(output_root, seqres_to_index)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _clear_in_progress(output_root)
     else:
         # Multiple GPU setting
         if len(AVAILABLE_GPUS) < num_gpus:
@@ -502,7 +683,13 @@ def dump_repr(
 
 
 def cli(args):
+    from confrover.utils import attach_run_file_logging
+
     from .loader import OpenFoldReprLoader
+
+    attach_run_file_logging(
+        Path(args.folding_repr) / "logs", command="openfold_repr"
+    )
 
     seqres_index_pairs = [
         tuple(row) for row in _load_seqres_index_pairs(args.input_csv).to_numpy()

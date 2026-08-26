@@ -19,7 +19,7 @@ import numpy as np
 
 # from data import utils as du
 import torch
-from openfold.utils import rigid_utils as ru
+from confrover._ext.openfold.utils import rigid_utils as ru
 from scipy.spatial.transform import Rotation
 
 from . import r3_diffuser, so3_diffuser

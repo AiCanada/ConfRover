@@ -37,9 +37,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-import openfold.np.residue_constants as residue_constants
-from openfold.data import data_transforms_multimer
-from openfold.model.embedders import (
+import confrover._ext.openfold.np.residue_constants as residue_constants
+from confrover._ext.openfold.data import data_transforms_multimer
+from confrover._ext.openfold.model.embedders import (
     ExtraMSAEmbedder,
     InputEmbedder,
     InputEmbedderMultimer,
@@ -48,19 +48,19 @@ from openfold.model.embedders import (
     TemplateEmbedder,
     TemplateEmbedderMultimer,
 )
-from openfold.model.evoformer import EvoformerStack, ExtraMSAStack
-from openfold.model.heads import AuxiliaryHeads
-from openfold.model.structure_module import StructureModule
-from openfold.model.template import (
+from confrover._ext.openfold.model.evoformer import EvoformerStack, ExtraMSAStack
+from confrover._ext.openfold.model.heads import AuxiliaryHeads
+from confrover._ext.openfold.model.structure_module import StructureModule
+from confrover._ext.openfold.model.template import (
     embed_templates_average,
     embed_templates_offload,
 )
-from openfold.utils.feats import (
+from confrover._ext.openfold.utils.feats import (
     atom14_to_atom37,
     build_extra_msa_feat,
     pseudo_beta_fn,
 )
-from openfold.utils.tensor_utils import (
+from confrover._ext.openfold.utils.tensor_utils import (
     add,
     masked_mean,
     tensor_tree_map,

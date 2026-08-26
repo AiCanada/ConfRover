@@ -22,7 +22,7 @@ def patch_openfold_deepspeed_bug():
     """
     Context manager to patch the OpenFold deepspeed bug with cpu testing.
     """
-    import openfold.model.primitives as primitives
+    import confrover._ext.openfold.model.primitives as primitives
 
     original_deepspeed_is_installed = primitives.deepspeed_is_installed
     primitives.deepspeed_is_installed = False

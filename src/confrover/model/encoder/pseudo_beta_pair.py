@@ -23,7 +23,7 @@ from typing import Any, Mapping, Optional
 
 import ml_collections as mlc
 import torch
-from openfold.model.primitives import Linear
+from confrover._ext.openfold.model.primitives import Linear
 from torch import nn
 
 from confrover.utils.torch.tensor import rearrange

@@ -40,7 +40,7 @@ logger = get_pylogger(__name__)
 
 
 def check_and_patch_openfold(env: CachePaths):
-    from openfold import __file__ as _openfold_path
+    from confrover._ext.openfold import __file__ as _openfold_path
 
     stereo_chemical_props_fpath = (
         Path(_openfold_path).parent / "resources/stereo_chemical_props.txt"

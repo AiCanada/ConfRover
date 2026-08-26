@@ -1,9 +1,34 @@
 # User-defined
 *output*/
-cache*/
+.tmp_openfold/
 pyrightconfig.json
 *local/
+
+# Caches (generated locally; do not commit)
 confrover_cache/
+cache/
+cache*/
+.cache/
+**/.cache/
+__pycache__/
+**/*__pycache__/
+.pytest_cache/
+ci/pytest/
+ci/pytest/**
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+.ipynb_checkpoints/
+.hydra/
+.webassets-cache
+lightning_logs/
+wandb/
+.huggingface/
+.torch/
+*.pyc
+*.pyo
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -116,6 +141,7 @@ data-bin
 # Environments
 .env
 .venv
+.venv310
 env/
 venv/
 ENV/
@@ -160,7 +186,15 @@ cython_debug/
 *.h5
 *.tar
 *.tar.gz
+*.ckpt
+/*.pt
+runs/
+DPF Training Teardown_files/
 
 # Lightning-Hydra-Template
 .env
 .hydra/
+
+# local run artefacts (checkpoints, logs, splits, init weights); keep only the launch/staging scripts
+runsPDB/*
+!runsPDB/*.ps1

@@ -20,8 +20,8 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from openfold.utils.chunk_utils import chunk_layer
-from openfold.utils.tensor_utils import (
+from confrover._ext.openfold.utils.chunk_utils import chunk_layer
+from confrover._ext.openfold.utils.tensor_utils import (
     flatten_final_dims,
     permute_final_dims,
 )

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ import hydra
 import torch
 from lightning import LightningDataModule, Trainer, seed_everything
 from lightning.pytorch.utilities import rank_zero_only
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from confrover import PACKAGE_ROOT
 from confrover.data.infer import GenDatasetConfig
@@ -88,6 +89,86 @@ def compose_hydra_config(
     return cfg
 
 
+#: DeepSpeed publishes wheels for only a handful of interpreters (on Windows the
+#: newest is cp312), so on most environments `pip install 'confrover[deepspeed]'`
+#: does not fetch a wheel -- it tries a source build, and deepspeed's setup.py
+#: imports torch during metadata generation, which PEP 517 build isolation runs
+#: in a fresh environment without torch. Telling a user to run that command is
+#: sending them at an error, so say what it actually takes instead.
+_DEEPSPEED_INSTALL_NOTE = (
+    "Enabling it means installing DeepSpeed with its deepspeed4science ops "
+    "built, which on most interpreters is a source build needing a CUDA "
+    "toolchain (and MSVC on Windows) plus `--no-build-isolation`, not a plain "
+    "pip install."
+)
+
+
+def resolve_use_kernel(requested: bool) -> bool:
+    """Turn off the DS4Sci evoformer kernel when DeepSpeed is not installed.
+
+    --use_kernel defaults to true, and DS4Sci_EvoformerAttention needs
+    DeepSpeed's deepspeed4science ops -- an optional extra with no wheels for
+    recent Python or Windows. Without this, `confrover generate` ran the whole
+    setup, loaded the model and the trajectories, and then died inside
+    triangular attention on the first block.
+    """
+    if not requested:
+        return False
+    # Use openfold's own flag rather than re-deriving the condition, so this
+    # cannot drift from what _deepspeed_evo_attn actually requires.
+    from confrover._ext.openfold.model.primitives import ds4s_is_installed
+
+    if ds4s_is_installed:
+        return True
+    log.warning(
+        "--use_kernel is on but DeepSpeed's deepspeed4science ops are not "
+        "installed; falling back to the plain attention path. Sampling uses "
+        "more GPU memory and is slower, but is otherwise identical. "
+        f"{_DEEPSPEED_INSTALL_NOTE}"
+    )
+    return False
+
+
+def resolve_trainer_strategy(cfg: DictConfig) -> str | None:
+    """Drop a DeepSpeed strategy when DeepSpeed is not installed.
+
+    configs/inference.yaml asks for ``deepspeed_stage_2_offload``, but DeepSpeed
+    is an optional extra -- it has no wheels for recent Python versions or for
+    Windows -- so ``confrover generate`` died inside Trainer construction on any
+    install without it, before loading a single structure.
+
+    Nothing in the suite caught that: ``infer_fast_test_run`` calls
+    ``model._ar_sample`` directly and never builds a Trainer, so the whole
+    generate orchestration path was unexercised.
+
+    ZeRO-2 with optimizer offload is a *training* strategy. Generation has no
+    optimizer to shard or offload, so on a single device this costs nothing.
+
+    Returns the strategy actually in effect, or None if there is no trainer cfg.
+    """
+    trainer_cfg = cfg.get("trainer", None) if hasattr(cfg, "get") else None
+    if trainer_cfg is None:
+        return None
+    strategy = trainer_cfg.get("strategy", None)
+    if not isinstance(strategy, str) or "deepspeed" not in strategy.lower():
+        return strategy
+    try:
+        installed = importlib.util.find_spec("deepspeed") is not None
+    except (ImportError, ValueError):
+        installed = False
+    if installed:
+        return strategy
+    log.warning(
+        f"Trainer strategy {strategy!r} requires DeepSpeed, which is not "
+        "installed; falling back to strategy='auto'. Generation has no "
+        "optimizer to shard, so on a single device this changes nothing and "
+        "needs no action."
+    )
+    with open_dict(trainer_cfg):
+        trainer_cfg.strategy = "auto"
+    return "auto"
+
+
 def generate(
     cfg: DictConfig,
     env: CachePaths,
@@ -125,6 +206,7 @@ def generate(
     model = load_model_checkpoint(model, cfg.model_ckpt, strict=True)
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
+    resolve_trainer_strategy(cfg)
     trainer: Trainer = hydra.utils.instantiate(cfg.trainer)
 
     # Setup output
@@ -166,6 +248,12 @@ def generate(
 def cli(args: argparse.Namespace):
     """Parse args from CLI and overrides default hydra yaml config"""
 
+    from confrover.utils import attach_run_file_logging
+
+    attach_run_file_logging(
+        Path(args.output) / "logs", command="generate"
+    )
+
     #### 1. Setup cache dir ####
     log.info(log_header(log, "ConfRover cache paths"))
     env = CachePaths(
@@ -190,7 +278,13 @@ def cli(args: argparse.Namespace):
             args.model
         )
 
-    model_cfg = torch.load(model_ckpt)["model_cfg"]
+    # torch>=2.6 defaults weights_only=True, which refuses the omegaconf DictConfig
+    # these checkpoints store under "model_cfg". This is the first load on the
+    # `confrover generate` path, reached before ConfRover.from_pretrained, and the
+    # file is a trusted local/registry checkpoint.
+    model_cfg = torch.load(model_ckpt, map_location="cpu", weights_only=False)[
+        "model_cfg"
+    ]
     args.model_ckpt = model_ckpt
 
     args.output_dir = str(Path(args.output) / Path(args.job_config).stem)
@@ -213,7 +307,7 @@ def cli(args: argparse.Namespace):
             # sampling cfg
             f"sampler.diffusion_steps={args.diffusion_steps}",
             f"model.seed={args.seed}",
-            f"model.use_deepspeed_evo_attention={args.use_kernel}",
+            f"model.use_deepspeed_evo_attention={resolve_use_kernel(args.use_kernel)}",
             f"model.kv_cache_type={args.kv_cache_type}",
         ],
     )
@@ -229,7 +323,7 @@ def cli(args: argparse.Namespace):
     #### 4. Post process ####
     trainer.lightning_module.writer.cleanup()
 
-    log.info(log_header(log, "✅ Job completion"))
+    log.info(log_header(log, "Job completion"))
     log.info(f"Output directory: {args.output_dir}")
 
 

@@ -19,8 +19,8 @@ import math
 import ml_collections as mlc
 import torch
 from einops import rearrange
-from openfold.model.primitives import Linear
-from openfold.utils import rigid_utils as ru
+from confrover._ext.openfold.model.primitives import Linear
+from confrover._ext.openfold.utils import rigid_utils as ru
 from torch import nn
 
 

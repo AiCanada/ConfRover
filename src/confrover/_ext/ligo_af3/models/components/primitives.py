@@ -28,7 +28,7 @@ import torch.nn.functional as F
 #     permute_final_dims,
 #     flatten_final_dims,
 # )
-from openfold.utils.tensor_utils import flatten_final_dims, permute_final_dims
+from confrover._ext.openfold.utils.tensor_utils import flatten_final_dims, permute_final_dims
 from scipy.stats import truncnorm
 from torch.nn import LayerNorm
 

@@ -26,7 +26,7 @@ from huggingface_hub import PyTorchModelHubMixin
 from lightning.pytorch import LightningModule, seed_everything
 from lightning.pytorch.utilities import move_data_to_device
 from omegaconf import DictConfig, OmegaConf
-from openfold.data.data_transforms import pseudo_beta_fn
+from confrover._ext.openfold.data.data_transforms import pseudo_beta_fn
 from tqdm import tqdm
 from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
 
@@ -41,6 +41,7 @@ from confrover.data.pretrain_repr import OpenFoldReprLoader
 from confrover.env import CachePaths
 from confrover.model.decoder import Decoder
 from confrover.model.decoder.confdiff.sampler.euler import EulerSampler
+from confrover.model.temporal.llama import TRANSFORMERS_VERSION, SinkCache
 from confrover.utils import PathLike, get_pylogger
 from confrover.utils.misc import download_file
 from confrover.utils.misc.install import check_and_install_dependencies
@@ -355,6 +356,19 @@ class ConfRover(
                 else:
                     raise ValueError(
                         f"String '{cache_type}' is not in the expected format: sink{{sink_num}}:{{sliding_window_length}}"
+                    )
+                if SinkCache is None:
+                    # Reject up front: the cache is only built deep inside the
+                    # generation loop, i.e. after the encoder has run and the
+                    # pretrained representations have been loaded, and the log line
+                    # below would otherwise claim a SinkCache run that cannot happen.
+                    raise NotImplementedError(
+                        f"kv_cache_type='{cache_type}' requires "
+                        "transformers.cache_utils.SinkCache, which was removed in "
+                        f"transformers>=5 (installed: transformers=="
+                        f"{TRANSFORMERS_VERSION}). Either install "
+                        "transformers==4.41.2 (the version ConfRover-base-20M was "
+                        "trained under) or use kv_cache_type='offloaded'."
                     )
                 logger.info(
                     f"Trajectory generation with SinkCache(num_sink={num_sink}, sliding_window_length={sliding_window_length})"
@@ -675,7 +689,14 @@ class ConfRover(
                 str(pretrained_model)
             )
 
-        model_ckpt = torch.load(pretrained_model)
+        # `weights_only` defaults to True on torch>=2.6, which refuses to unpickle
+        # the omegaconf `DictConfig` stored under "model_cfg" in released ConfRover
+        # checkpoints. These are trusted, locally-resolved files (either a path the
+        # caller passed or a checkpoint downloaded from the ByteDance-Seed HF repo),
+        # so full unpickling is intentional here.
+        model_ckpt = torch.load(
+            pretrained_model, map_location="cpu", weights_only=False
+        )
 
         model: ConfRover = cls.from_config(
             model_ckpt["model_cfg"],

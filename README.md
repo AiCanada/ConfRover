@@ -23,6 +23,8 @@ Learning Protein Conformation and Dynamics through Autoregression
   - [Installation](#installation)
   - [Python API](#python-api)
   - [Command Line Interface](#command-line-interface)
+- [DPF fine-tuning](#dpf-fine-tuning)
+- [Tests](#tests)
 - [Limitations](#limitations)
 - [License](#license)
 - [Citations](#citing-confrover)
@@ -67,6 +69,7 @@ See our [paper](https://arxiv.org/abs/2505.17478) and [website](https://bytedanc
 
 ## Updates
 
+- [2026-08] Local DPF fine-tune path: `confrover train` on Dual Personality Fragments, family-level split (no conformation leakage), vendored OpenFold, family-bag sampler.
 - [2025-11] ConfRover v1.0 released!
 - [2025-09] ConfRover is accepted to NeurIPS 2025!
 
@@ -98,10 +101,12 @@ conda activate confrover
 git clone https://github.com/ByteDance-Seed/ConfRover.git
 cd ConfRover
 
-# first install confrover and other dependencies, then openfold (requires torch pre-installed)
-pip install . && pip install --no-build-isolation .[openfold]
+# first install confrover and other dependencies
+pip install .
 ```
-> ConfRover has been tested on NVIDIA H100 with CUDA 12.6
+> Official generate path: NVIDIA H100, CUDA 12.6, **Python 3.10**, torch 2.1.2, transformers 4.41.2.
+>
+> This checkout also trains on **Python 3.13** / torch 2.13 / transformers 5.14 (Windows + CUDA). Generation on that stack is numerically close to the H100 golden file (~0.002 Å) but not bitwise identical. For a bitwise replay of `tests/infer`, use the 3.10 env (`.venv310`).
 
 ### Python API
 
@@ -157,7 +162,14 @@ Method `ConfRover.generate()` is designed for simple runs or integrating ConfRov
 
 ### Command line interface
 
-ConfRover provides a command line interface for parallel generation over multiple GPUs. A `.json`` manifest file is required to specify the generation tasks and cases. 
+ConfRover provides a command line interface. Subcommands:
+
+| Command | Purpose |
+|---|---|
+| `confrover generate` | Batch generation (forward / IID / interp) |
+| `confrover train` | Fine-tune **ConfRover-base-20M-v1.0** on Dual Personality Fragments |
+| `confrover query_msa` | ColabFold MMSeqs2 MSA cache |
+| `confrover openfold_repr` | Recycle-3 single/pair embeddings for training |
 
 ```bash
 confrover generate \
@@ -166,7 +178,7 @@ confrover generate \
     --model <model_name/weight_path> \
     [...] 
 
-# See `confrover generate --help` for detailed arguments.
+# See `confrover generate --help` and `confrover train --help`.
 ```
 
 #### Input manifest format
@@ -288,22 +300,151 @@ job_name/
 
 #### Intermediate cache assets
 
-ConfRover leverages state-of-the-art folding models to extract protein-level representations as an input. 
-We cache and reuse the MSA and protein representations for efficient generation. 
-We use the `$(pwd)/confrover_cache` as the default cache location to save these intermediate assets and model weights. Use the `--cache_dir` argument to specify a different cache location. See `--help` for more details.
+ConfRover uses OpenFold recycle-3 **single** `[L, 384]` and **pair** `[L, L, 128]` embeddings as encoder input. PDB/XTC coordinates are training **targets**, not a substitute for those embeddings. MSA + embeddings are keyed by **exact seqres** (one cache entry per sequence, reused for every replica and frame).
 
+Default root: `$(pwd)/confrover_cache`. Override with `--cache_dir`.
 
-<!-- ## Advanced usage
+| Path | Contents |
+|---|---|
+| `confrover_cache/confrover_ckpts/` | Downloaded `ConfRover-base-20M-v1.0` |
+| `confrover_cache/msa/` | ColabFold `.a3m` |
+| `confrover_cache/folding_repr/` | OpenFold `.npy` + `seqres_to_index.csv` |
+| `confrover_cache/openfold_params/` | OpenFold weights (`finetuning_no_templ_ptm_1.pt`) |
+| `confrover_cache/confrover_base_atlas_train_ids.csv` | 1,080 ATLAS chains used in published pretrain (auto-excluded from DPF train) |
 
-### Reproduce ATLAS results
-Coming soon! -->
+This directory is gitignored.
 
+Each CLI command also writes a **UTF-8 debug dump** under `<output>/logs/` (train/generate) or `<cache>/logs/` (MSA / OpenFold):
+
+| File | Contents |
+|---|---|
+| `debug.log` | Every log line (DEBUG+), timestamps, logger, file:line, pid |
+| `issues.log` | WARNING+ only (family filters, CUDA, dead-unit repair, crashes) |
+| `faults.log` | Native fatal signals (`faulthandler`) |
+| `environment.txt` | argv, Python, torch/CUDA, git |
+
+`confrover train --log_dir PATH` overrides the default `<output>/logs`. Uncaught exceptions are written with full traceback before the process exits.
+
+## DPF fine-tuning
+
+Additional training on Dual Personality Fragments is **ConfRover-base-20M-v1.0 only** (`forward` + `iid`). Do not load or mix `ConfRover-interp-20M-v1.0`.
+
+**Identity is the family** (directory name / `family_id` / sequence). Split is train XOR val XOR test **by family**. Putting personality A in train and B in test is illegal. All replicas and XTC frames stay with the family.
+
+### Data layout
+
+ATLAS-style store (default `CONFROVER_DPF_ROOT` or `--dpf_root`):
+
+```text
+$DPF_ROOT/<pdbid>_<chain>/protein/
+    <pdbid>_<chain>.pdb
+    <pdbid>_<chain>_prod_R{1,2,3}_fit.xtc   # 10 ps / ~10,000 frames; this is the train source
+$DPF_ROOT/<pdbid>_<chain>/analysis/         # 100 ps XTCs — not used; missing protein/ XTCs is an error
+```
+
+Static folders (any number of PDBs) and a JSON catalog are also accepted. A flat dump of mixed proteins in one folder is not a valid catalog.
+
+Training reads **`protein/`** fitted XTCs. Each family is a bag (all static PDBs + every 50th XTC frame). Each epoch draws a fixed `M` IID targets and `M` forward hops (default `M=8`, hop 256 frames = 2.56 ns, same replica). A 1-PDB family and a 10k-frame XTC contribute the same number of steps.
+
+### OpenFold representations
+
+Required before `confrover train`. One embedding per unique seqres:
+
+```bash
+# 1) index (seqres,index) — e.g. confrover_cache/dpf_seqres_index.csv
+# 2) MSAs
+confrover query_msa \
+    --input_csv confrover_cache/dpf_seqres_index.csv \
+    --msa_root confrover_cache/msa
+
+# 3) recycle-3 single/pair
+confrover openfold_repr \
+    --input_csv confrover_cache/dpf_seqres_index.csv \
+    --msa_root confrover_cache/msa \
+    --folding_repr confrover_cache/folding_repr \
+    --openfold_params confrover_cache/openfold_params \
+    --num_workers 1
+```
+
+OpenFold is vendored at `src/confrover/_ext/openfold` (no `import openfold`). Pair tensors grow as `L²`; long chains (≳384 residues) may OOM on 8 GB GPUs.
+
+### Train
+
+```bash
+confrover train \
+    --dpf_root "<ATLAS DPF root>" \
+    --output runs/dpf_base_train \
+    --cache_dir confrover_cache \
+    --folding_repr confrover_cache/folding_repr \
+    --model ConfRover-base-20M-v1.0 \
+    --tasks iid,forward \
+    --samples_per_family 8 \
+    --family_excludelist auto \
+    --max_seqlen 384 \
+    --n_val 5 \
+    --n_holdout 5 \
+    --max_epochs 3 \
+    --lr_schedule cosine
+```
+
+The same command is the resume command (`--resume auto` is the default): if `<output>/checkpoints` already has a `.ckpt`, training continues from it with the same remaining bag and shuffle.
+
+| Flag | Role |
+|---|---|
+| `--family_excludelist auto` | Drop chains already in the 1,080-protein base train list (`5x1u_B` on the 100-family DPF set) |
+| `--max_seqlen 384` | Same length cap as published pretrain; required on 8 GB GPUs (fused tokens are `L+L²`) |
+| `--lr_schedule cosine` | Warmup 50 steps to `1e-4`, cosine to `1e-5`. `--lr_schedule constant` is a flat `1e-4` |
+| `--resume auto` | Default. Continue the newest checkpoint, or start fresh if there is none. `none`/`off` forces a new run |
+| `--max_epochs` | Default **3**. Another epoch redraws frames from the **same train families**; it does not touch val/test |
+
+To stop or pause a long run without losing the current epoch, drop an empty `STOP` or `PAUSE` file in `<output>` (or press Ctrl+C). The current step finishes, then a checkpoint is written that includes the bag epoch and loader cursor. Rerun the same command to continue. Do not `Stop-Process -Force` on Windows — that cannot be caught and skips the save.
+
+Writes `confrover_base_dpf.pt` (ConfRover `from_pretrained` schema) plus Lightning checkpoints. The published base file is not overwritten.
+
+`--family_allowlist` can restrict to a chain list such as `scripts/newpdbidlistrain.py` output (novel ATLAS PDB IDs, L ≤ 384).
+
+Paper pretrain (Appendix D.2): **180 epochs** on **1,080** ATLAS proteins, random 9-frame windows, 8× H100. `--window_frames 9` (the default) trains the same way: each example is 9 frames of one protein (a trajectory at one stride from the 1–1024 ladder, or 9 distinct structures of a PDB cluster) and every frame is predicted from the ones before it. `--window_frames 1` is the earlier single-target bag. That is from-scratch, not a schedule to copy onto 76 DPF families. A few epochs with early stop on **full val** is the right fine-tune.
+
+## Cloud run (rented Linux GPU)
+
+The 9-frame configuration does not fit an 8 GB card. To run it on a rented instance:
+
+```powershell
+# 1. stage the payload locally (hardlinks; ~33 GB, mostly OpenFold representations)
+.\runsPDB\stage_PDBcluster_payload.ps1
+# 2. upload it to a Hugging Face dataset repo you own
+hf upload <user>/<repo> A:\payloads\PDBcluster_from_base payloads/PDBcluster_from_base --repo-type dataset
+```
+On the instance (repo cloned, `HF_TOKEN` exported):
+```bash
+HF_REPO=<user>/<repo> bash scripts/vast_bootstrap_pdbcluster.sh          # install, download, verify, 6-step smoke
+HF_REPO=<user>/<repo> bash scripts/vast_bootstrap_pdbcluster.sh --train  # ... then train, syncing checkpoints to the Hub
+```
+`scripts/stage_remote_payload.py --catalog ...` ships a catalog JSON by path (the unique
+PDB-cluster catalog merges structures across directories, so a directory scan cannot
+reproduce its fingerprint), the edited split, the original base weights and only the
+train+val representations. `scripts/verify_remote_payload.py` gates training on the
+manifest, path resolution and split fingerprint. `scripts/vast_bootstrap.sh` is the
+older ATLAS v888 resume and is unchanged.
+
+## Tests
+
+```bash
+# Official generate smoke (GPU + bundled test_data OpenFold npy)
+python -m pytest tests/infer -o addopts= -q
+
+# DPF train suite (catalog, split, sampler, loss, native from_config)
+python -m pytest tests/dpf -o addopts= -q
+```
+
+`-o addopts=` turns off the repo default `-n 4` if `pytest-xdist` is unused. `tests/infer/test_infer_produces_expected_pdb` uses exact `assert_array_equal`; a ~0.002 Å drift on a different GPU fails the test without meaning a different fold.
 
 ## Limitations
 
 - **Protein-only, single-chain.** Current ConfRover models support only proteins and assume a single polypeptide chain.
-- **Out-of-scope use.** ConfRover-v1.0 is trained mainly on the ATLAS dataset with 100 ns trajectories, which may restrict learned dynamics to short-timescale, local motions.
+- **Out-of-scope use.** ConfRover-v1.0 is trained mainly on the ATLAS dataset with 100 ns trajectories, which may restrict learned dynamics to short-timescale, local motions. DPF fine-tuning does not change that timescale.
 - **Backbone-focused diffusion.** Diffusion operates on backbone SE(3) space, with side chains reconstructed through predicted torsional angles, which may reduce accuracy for large rotamer changes.
+- **Base vs interp.** `confrover train` refuses interp weights and interp tasks. Interpolation still uses `ConfRover-interp-20M-v1.0` at generate time only.
 
 
 ## License
@@ -330,7 +471,7 @@ Please do **not** create a public GitHub issue.
 
 ## Acknowledgements
 
-ConfRover builds on prior open source work with components adapted from [ColabFold](https://github.com/sokrypton/ColabFold), [OpenFold](https://github.com/aqlaboratory/openfold), [Ligo-Biosciences](https://github.com/Ligo-Biosciences/AlphaFold3), [SE3-Diffusion](https://github.com/jasonkyuyim/se3_diffusion). We gratefully acknowledge these contributions.
+ConfRover builds on prior open source work with components adapted from [ColabFold](https://github.com/sokrypton/ColabFold), [OpenFold](https://github.com/aqlaboratory/openfold), [Ligo-Biosciences](https://github.com/Ligo-Biosciences/AlphaFold3), [SE3-Diffusion](https://github.com/jasonkyuyim/se3_diffusion). We gratefully acknowledge these contributions. This checkout vendors OpenFold under `src/confrover/_ext/openfold` (Apache-2.0) so training and residue-constant geometry do not require a separate `openfold` install.
 
 ## Citing ConfRover
 
@@ -342,5 +483,28 @@ If you find ConfRover useful in your research, please cite the following paper:
   author={Shen, Yuning and Wang, Lihao and Yuan, Huizhuo and Wang, Yan and Yang, Bangji and Gu, Quanquan},
   journal={arXiv preprint arXiv:2505.17478},
   year={2025}
+}
+```
+
+### Citing ATLAS
+
+Both the published pretrain (1,080 chains) and the DPF fine-tune train on
+[ATLAS](https://www.dsimb.inserm.fr/ATLAS/) molecular dynamics trajectories. If you use
+this work, please also cite:
+
+> Vander Meersche, Y., Cretin, G., Gheeraert, A., Gelly, J. C., & Galochkina, T. (2024).
+> ATLAS: protein flexibility description from atomistic molecular dynamics simulations.
+> *Nucleic Acids Research*, 52(D1), D384–D392. doi:[10.1093/nar/gkad1084](https://doi.org/10.1093/nar/gkad1084)
+
+```latex
+@article{atlas2024,
+  title={ATLAS: protein flexibility description from atomistic molecular dynamics simulations},
+  author={Vander Meersche, Yann and Cretin, Gabriel and Gheeraert, Aria and Gelly, Jean-Christophe and Galochkina, Tatiana},
+  journal={Nucleic Acids Research},
+  volume={52},
+  number={D1},
+  pages={D384--D392},
+  year={2024},
+  doi={10.1093/nar/gkad1084}
 }
 ```

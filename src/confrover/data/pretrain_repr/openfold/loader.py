@@ -50,8 +50,56 @@ default_cache = CachePaths()
 # =============================================================================
 
 
+def _assert_repr_matches(
+    index: str, path: str, n_residues: int, seqres: str
+) -> None:
+    """Fail loudly if a representation is not the right length for its sequence.
+
+    The load path resolves seqres -> index -> directory, and every step of that
+    is a name lookup: nothing until here has compared the array against the
+    protein it is supposed to encode. A representation generated from another
+    family's alignment is a perfectly well-formed tensor, and the collate step
+    pads ragged lengths without complaint, so an unchecked mismatch trains
+    silently on the wrong protein rather than failing.
+
+    Length is a necessary, not sufficient, check -- two proteins of the same
+    size still pass. It is the cheapest guard that catches the common case at
+    the point of use, and it costs one integer comparison per load.
+    """
+    if n_residues != len(seqres):
+        raise ValueError(
+            f"{index}: cached representation is {n_residues} residues but the "
+            f"requested sequence is {len(seqres)}. The repr under this index "
+            f"belongs to a different protein -- regenerate it. ({path})"
+        )
+
+
+def _write_index_atomic(index_file: Path, seqres_to_index: dict) -> None:
+    """Write ``seqres_to_index.csv`` via a temp file and ``os.replace``.
+
+    ``to_csv`` truncates in place, so a crash part-way through leaves a torn
+    index that the next run parses as authoritative: every family missing from
+    it reads as "not yet generated" and silently re-runs hours of GPU work.
+    A reader that arrives mid-write (a DataLoader worker building its own
+    loader) sees the same torn file. The swap makes it all-or-nothing.
+    """
+    tmp = index_file.with_name(index_file.name + ".tmp")
+    pd.DataFrame(seqres_to_index.items(), columns=["seqres", "index"]).to_csv(
+        tmp, index=False
+    )
+    os.replace(tmp, index_file)
+
+
 def _get_seqres_index(repr_dir: PathLike) -> tuple[str, str]:
-    """Get seqres from cached repr record"""
+    """Get seqres from a cached repr record.
+
+    Returns ``("", "")`` for anything that is not a complete record: no meta
+    (a run died between the npy writes and the meta write), or a meta that
+    cannot be parsed (it died mid-``json.dump``). Callers must drop those
+    rather than index them. One bad directory must not take down the scan --
+    the scan runs inside ``OpenFoldReprLoader.__init__``, so raising here
+    would make every later construction fail until the file is removed by hand.
+    """
 
     repr_dir = Path(repr_dir)
     index = repr_dir.name
@@ -60,9 +108,16 @@ def _get_seqres_index(repr_dir: PathLike) -> tuple[str, str]:
     if not metadata_fpath.exists():
         logger.warning(f"Meta data file not found: {metadata_fpath}")
         return "", ""
-    with open(metadata_fpath, "r") as handle:
-        metadata = json.load(handle)
-    seqres = metadata["seqres"]
+    try:
+        with open(metadata_fpath, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        seqres = metadata["seqres"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.warning(f"Unreadable meta, skipping {metadata_fpath}: {exc!r}")
+        return "", ""
+    if not isinstance(seqres, str) or not seqres:
+        logger.warning(f"Meta has no seqres, skipping {metadata_fpath}")
+        return "", ""
     return seqres, index
 
 
@@ -113,6 +168,23 @@ class OpenFoldReprLoader:
         # else:
         #     return str()
 
+    def repr_paths(self, index: str) -> list[Path]:
+        """The npy files ``load`` will need for ``index`` at ``self.num_recycles``."""
+        repr_dir = Path(self.index_to_dir(index))
+        paths = []
+        if self.load_single:
+            paths.append(
+                repr_dir / f"{index}_recycle{self.num_recycles:d}_single_repr.npy"
+            )
+        if self.load_pair:
+            paths.append(
+                repr_dir / f"{index}_recycle{self.num_recycles:d}_pair_repr.npy"
+            )
+        return paths
+
+    def has_repr_files(self, index: str) -> bool:
+        return all(path.is_file() for path in self.repr_paths(index))
+
     def seqres_to_dir(self, seqres: str):
         if seqres not in self.seqres_to_index:
             raise FileNotFoundError(
@@ -135,9 +207,22 @@ class OpenFoldReprLoader:
         has_cache = []
         not_found = []
         for seqres in seqres_set:
-            if seqres in self.seqres_to_index:
+            # An index row is a claim about disk, not evidence of it. A record
+            # whose directory was removed still reads as cached, so generation
+            # skips it and the run dies later on a missing npy -- hours in, with
+            # the cause long out of view. The directory alone is not enough
+            # either: the files are named by recycle count, so a store built at
+            # a different ``num_recycles`` has the directory and none of the
+            # files ``load`` will ask for.
+            index = self.seqres_to_index.get(seqres)
+            if index is not None and self.has_repr_files(str(index)):
                 has_cache.append(seqres)
             else:
+                if index is not None:
+                    logger.warning(
+                        "Index points at a repr dir without "
+                        f"recycle{self.num_recycles} files, regenerating: {index}"
+                    )
                 not_found.append(seqres)
         logger.info(
             f"Input seqres: {num_input_seqres:,} (unique {num_unique_seqres:,}), cached: {len(has_cache):,}, missing: {len(not_found):,}"
@@ -173,7 +258,13 @@ class OpenFoldReprLoader:
             msa_max_query_size (int, optional): Maximum number of MSA to query, pass to MSALoader. Defaults to 32.
         """
 
-        # 1. check cache and remove existing repr if overwrite is True
+        # 1. Rescan disk so a crashed run can resume from written npy/meta.
+        #    save=False: the merged mapping is written two lines down, and
+        #    writing the scan first would briefly publish a smaller index.
+        scanned = self.build_index_file(save=False)
+        self.seqres_to_index.update(scanned)
+        self.save_index_file()
+
         logger.info(log_header(logger, "Check OpenFold repr cache"))
         has_cache, not_found = self.check_cache(
             seqres_list=[seqres for seqres, _ in seqres_index_pairs]
@@ -196,13 +287,18 @@ class OpenFoldReprLoader:
         # deduplicate to_query by seqres
         to_query = list({k: v for k, v in to_query}.items())
 
-        # 2. check if MSA exists and query if not
+        # 2. check if MSA exists and query if not. ``overwrite`` is deliberately
+        #    not forwarded: it means "regenerate the representations", and the
+        #    alignments they are built from are still good. Forwarding it made
+        #    `openfold_repr --overwrite` delete and re-download every MSA too.
+        #    A wrong alignment is caught by ``_assert_msa_matches`` at
+        #    generation time and re-queried by ``query_msa`` on its own.
         msa_loader = MSALoader(msa_root=msa_root)
         msa_loader.query_msa(
             seqres_index_pairs=to_query,
             max_query_size=msa_max_query_size,
             clean_tmp_dir=True,
-            overwrite=overwrite,
+            overwrite=False,
         )
 
         # 3. Generate repr
@@ -224,7 +320,7 @@ class OpenFoldReprLoader:
         # 4. Update index
         self.seqres_to_index.update(seqres_to_index)
         logger.info(
-            f"✅ Generated new representations for {len(seqres_index_pairs):,} proteins ({len(seqres_to_index):,} succeeded, {len(failed):,} failed)."
+            f"Generated new representations for {len(seqres_index_pairs):,} proteins ({len(seqres_to_index):,} succeeded, {len(failed):,} failed)."
         )
         self.save_index_file()
 
@@ -246,6 +342,7 @@ class OpenFoldReprLoader:
             )
             if os.path.exists(single_repr_path):
                 singel_repr = np.load(single_repr_path)
+                _assert_repr_matches(index, single_repr_path, singel_repr.shape[0], seqres)
                 repr_dict["pretrained_single"] = torch.from_numpy(singel_repr).float()
             else:
                 raise FileNotFoundError(
@@ -258,6 +355,7 @@ class OpenFoldReprLoader:
             )
             if os.path.exists(pair_repr_path):
                 pair_repr = np.load(pair_repr_path)
+                _assert_repr_matches(index, pair_repr_path, pair_repr.shape[0], seqres)
                 repr_dict["pretrained_pair"] = torch.from_numpy(pair_repr).float()
             else:
                 raise FileNotFoundError(
@@ -265,8 +363,16 @@ class OpenFoldReprLoader:
                 )
         return repr_dict
 
-    def build_index_file(self):
-        """Scan through self.repr_root and build index file"""
+    def build_index_file(self, save: bool = True):
+        """Scan through self.repr_root and build index file.
+
+        ``save=False`` returns the scan without touching disk. A caller that is
+        about to merge the scan into ``self.seqres_to_index`` and save must use
+        it: writing the scan-only mapping first leaves a window where the CSV
+        holds strictly fewer records than before, and anything that dies in it
+        loses every entry known only to the old file -- which then reads as
+        "not yet generated" and silently re-runs hours of GPU work.
+        """
         logger.info(f"Building index file from {self.repr_root} ...")
         if self.v1:
             subdir_list = [
@@ -282,28 +388,24 @@ class OpenFoldReprLoader:
             ]
         logger.info(f"{len(subdir_list):,} records found {self.repr_root}.")
         repr_info = map(_get_seqres_index, subdir_list)
+        # ``_get_seqres_index`` signals an incomplete record with ("", ""); an
+        # ``is not None`` filter let that through and wrote an empty row into
+        # the CSV, which pandas reads back as a NaN -> NaN mapping.
         seqres_to_index = {
-            seqres: idx
-            for seqres, idx in repr_info
-            if seqres is not None and idx is not None
+            seqres: idx for seqres, idx in repr_info if seqres and idx
         }
 
-        seqres_to_index_df = pd.DataFrame(
-            seqres_to_index.items(), columns=["seqres", "index"]
-        )
-        seqres_to_index_df.to_csv(self.index_file, index=False)
+        if save:
+            _write_index_atomic(self.index_file, seqres_to_index)
         logger.info(f"Index file contains {len(seqres_to_index):,} records.")
         return seqres_to_index
 
     def save_index_file(self):
         """Save updated index file"""
         logger.info(
-            f"✅ Index file updated with {len(self.seqres_to_index):,} records: {self.index_file}"
+            f"Index file updated with {len(self.seqres_to_index):,} records: {self.index_file}"
         )
-        seqres_to_index_df = pd.DataFrame(
-            self.seqres_to_index.items(), columns=["seqres", "index"]
-        )
-        seqres_to_index_df.to_csv(self.index_file, index=False)
+        _write_index_atomic(self.index_file, self.seqres_to_index)
 
     def delete_repr(self, seqres_list: List[str], enforce: bool = False):
         """Delete repr for given seqres"""

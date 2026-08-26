@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
-from openfold.utils.tensor_utils import add
+from confrover._ext.openfold.utils.tensor_utils import add
 
 from .components.attention_pair_bias import AttentionPairBias
 from .components.dropout import DropoutColumnwise, DropoutRowwise

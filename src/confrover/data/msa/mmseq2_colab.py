@@ -97,6 +97,20 @@ DEFAULT_PATH = CachePaths()
 DEFAULT_AGENT = f"confrover/{CONFROVER_VERSION}"
 
 COLABFOLD_URL = "https://api.colabfold.com"
+# ColabFold's own client uses 6.02s for every call. A 32-seq result tar
+# routinely takes longer than that to start sending, which produced
+# "Timeout while fetching result from MSA server" then Read timed out.
+CONNECT_TIMEOUT = 15.05
+READ_TIMEOUT_LIGHT = 60.0
+READ_TIMEOUT_DOWNLOAD = 300.0
+TIMEOUT_LIGHT = (CONNECT_TIMEOUT, READ_TIMEOUT_LIGHT)
+TIMEOUT_DOWNLOAD = (CONNECT_TIMEOUT, READ_TIMEOUT_DOWNLOAD)
+
+#: Pause after a ticket reports COMPLETE, before the first download attempt.
+#: Kept short deliberately: download() validates the tar and retries with
+#: backoff, so this only has to cover the common case, and it is paid once per
+#: batch on every run whether or not the tar was ready.
+COMPLETE_SETTLE_SECONDS = 2.0
 
 TQDM_BAR_FORMAT = (
     "{l_bar}{bar}| {n_fmt}/{total_fmt} [elapsed: {elapsed} remaining: {remaining}]"
@@ -135,19 +149,31 @@ def run_mmseqs2(
             query += f">{n}\n{seq}\n"
             n += 1
 
+        # Hoisted out of the loop: reset per iteration, the `error_count > 5`
+        # cap below can never be reached and a persistent server outage retries
+        # forever instead of surfacing.
+        error_count = 0
         while True:
-            error_count = 0
             try:
                 # https://requests.readthedocs.io/en/latest/user/advanced/#advanced
                 # "good practice to set connect timeouts to slightly larger than a multiple of 3"
                 res = requests.post(
                     f"{host_url}/{submission_endpoint}",
                     data={"q": query, "mode": mode},
-                    timeout=6.02,
+                    timeout=TIMEOUT_LIGHT,
                     headers=headers,
                 )
             except requests.exceptions.Timeout:
-                logger.warning("Timeout while submitting to MSA server. Retrying...")
+                error_count += 1
+                logger.warning(
+                    "Timeout while submitting to MSA server. "
+                    f"Retrying... ({error_count}/5)"
+                )
+                # Without a sleep a connect timeout becomes a tight loop against
+                # a server that is already struggling.
+                time.sleep(5)
+                if error_count > 5:
+                    raise
                 continue
             except Exception as e:
                 error_count += 1
@@ -169,16 +195,23 @@ def run_mmseqs2(
         return out
 
     def status(ID):
+        # Hoisted out of the loop -- see submit(); reset per iteration the cap
+        # below is unreachable.
+        error_count = 0
         while True:
-            error_count = 0
             try:
                 res = requests.get(
-                    f"{host_url}/ticket/{ID}", timeout=6.02, headers=headers
+                    f"{host_url}/ticket/{ID}", timeout=TIMEOUT_LIGHT, headers=headers
                 )
             except requests.exceptions.Timeout:
+                error_count += 1
                 logger.warning(
-                    "Timeout while fetching status from MSA server. Retrying..."
+                    "Timeout while fetching status from MSA server. "
+                    f"Retrying... ({error_count}/5)"
                 )
+                time.sleep(5)
+                if error_count > 5:
+                    raise
                 continue
             except Exception as e:
                 error_count += 1
@@ -200,29 +233,53 @@ def run_mmseqs2(
 
     def download(ID, path):
         error_count = 0
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         while True:
             try:
                 res = requests.get(
-                    f"{host_url}/result/download/{ID}", timeout=6.02, headers=headers
+                    f"{host_url}/result/download/{ID}",
+                    timeout=TIMEOUT_DOWNLOAD,
+                    headers=headers,
+                    stream=True,
                 )
+                res.raise_for_status()
+                # Stream to a temp file and swap it in only once it is complete
+                # and readable. Writing straight to `path` leaves a truncated
+                # tar behind when a download dies mid-stream, and the
+                # `os.path.isfile(tar_gz_file)` guard upstream then treats that
+                # stump as a finished download on the next run -- surfacing as
+                # "not a gzip file" with no hint that the cache is the problem.
+                tmp_path = f"{path}.part"
+                with open(tmp_path, "wb") as out:
+                    for chunk in res.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            out.write(chunk)
+                # The ticket can flip COMPLETE just before the tar is readable,
+                # so a short unusable body is an ordinary retry, not a failure.
+                with tarfile.open(tmp_path, "r:gz") as check:
+                    check.getmembers()
+                os.replace(tmp_path, path)
             except requests.exceptions.Timeout:
+                error_count += 1
                 logger.warning(
-                    "Timeout while fetching result from MSA server. Retrying..."
+                    "Timeout while fetching result from MSA server. "
+                    f"Retrying... ({error_count}/10)"
                 )
+                time.sleep(20)
+                if error_count > 10:
+                    raise
                 continue
             except Exception as e:
                 error_count += 1
                 logger.warning(
-                    f"Error while fetching result from MSA server. Retrying... ({error_count}/5)"
+                    f"Error while fetching result from MSA server. Retrying... ({error_count}/10)"
                 )
                 logger.warning(f"Error: {e}")
-                time.sleep(5)
-                if error_count > 5:
+                time.sleep(20)
+                if error_count > 10:
                     raise
                 continue
             break
-        with open(path, "wb") as out:
-            out.write(res.content)
 
     # process input x
     seqs = [x] if isinstance(x, str) else x
@@ -308,6 +365,13 @@ def run_mmseqs2(
                 if out["status"] == "COMPLETE":
                     if TIME < TIME_ESTIMATE:
                         pbar.update(n=(TIME_ESTIMATE - TIME))
+                    # The result tar is often not readable the instant the
+                    # ticket flips COMPLETE. A flat 30s here is paid once per
+                    # batch even when it is ready -- 625 batches at
+                    # --max_query_size 32 is over five hours of pure idle. The
+                    # download now validates the tar and retries with backoff,
+                    # so a brief settle is enough and the retry absorbs the rest.
+                    time.sleep(COMPLETE_SETTLE_SECONDS)
                     REDO = False
 
                 if out["status"] == "ERROR":
@@ -318,7 +382,12 @@ def run_mmseqs2(
                     )
 
             # Download results
+            logger.info(
+                f"Downloading MSA result {ID} "
+                f"(timeout {int(READ_TIMEOUT_DOWNLOAD)}s) ..."
+            )
             download(ID, tar_gz_file)
+            logger.info(f"Downloaded MSA result {ID}")
 
     # prep list of a3m files
     if use_pairing:
@@ -356,21 +425,28 @@ def run_mmseqs2(
                 os.mkdir(TMPL_PATH)
                 TMPL_LINE = ",".join(TMPL[:20])
                 response = None
+                # Hoisted out of the loop -- see submit(); reset per iteration
+                # the cap below is unreachable.
+                error_count = 0
                 while True:
-                    error_count = 0
                     try:
                         # https://requests.readthedocs.io/en/latest/user/advanced/#advanced
                         # "good practice to set connect timeouts to slightly larger than a multiple of 3"
                         response = requests.get(
                             f"{host_url}/template/{TMPL_LINE}",
                             stream=True,
-                            timeout=6.02,
+                            timeout=TIMEOUT_DOWNLOAD,
                             headers=headers,
                         )
                     except requests.exceptions.Timeout:
+                        error_count += 1
                         logger.warning(
-                            "Timeout while submitting to template server. Retrying..."
+                            "Timeout while submitting to template server. "
+                            f"Retrying... ({error_count}/5)"
                         )
+                        time.sleep(5)
+                        if error_count > 5:
+                            raise
                         continue
                     except Exception as e:
                         error_count += 1
@@ -428,6 +504,27 @@ def run_mmseqs2(
 # =============================================================================
 # Main
 # =============================================================================
+
+
+def _a3m_query(path) -> str | None:
+    """Query sequence an a3m actually holds, or None if it cannot be read.
+
+    Reads only the first record, so checking a cache entry costs a few hundred
+    bytes rather than the whole alignment.
+    """
+    try:
+        chunks, started = [], False
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith(">"):
+                    if started:
+                        break
+                    started = True
+                elif started and line.strip():
+                    chunks.append(line.strip())
+        return "".join(chunks).replace("-", "").upper() or None
+    except OSError:
+        return None
 
 
 def batch_query(
@@ -496,14 +593,31 @@ def batch_query(
 
         # Save it in AlphaFold compatible format
         # NOTE: we always use index[:2] as a level of subdirectory
-        for (seqres, index), msa in zip(job_batch, msas):
-            new_index = unique_dir(output_dir / index[:2] / index).stem
-            if new_index != index:
-                logger.warning(f"Index {index} already exists. Using {new_index}")
+        # strict=True: run_mmseqs2 returns one alignment per submitted sequence
+        # in submitted order, and a silent zip truncation here would write every
+        # remaining alignment under the wrong family name.
+        for (seqres, index), msa in zip(job_batch, msas, strict=True):
+            a3m_path = output_dir / index[:2] / index / "a3m" / f"{index}.a3m"
+            if a3m_path.is_file() and a3m_path.stat().st_size > 0:
+                # An a3m already under this name is only reusable if it holds
+                # *this* sequence. Family ids are reused across rebuilds, so the
+                # file may be a previous run's alignment for a different
+                # protein; skipping the write then throws away the alignment
+                # just downloaded and still records seqres -> index, leaving the
+                # index asserting a mapping the file contradicts.
+                if _a3m_query(a3m_path) == seqres:
+                    logger.info(f"MSA already on disk for {index}, skipping write")
+                    updated_seqres_index_pairs.append((seqres, index))
+                    continue
+                new_index = unique_dir(output_dir / index[:2] / index).name
+                logger.warning(
+                    f"{index} already holds a different sequence. Using {new_index}"
+                )
                 index = new_index
             a3m_dir = output_dir / index[:2] / index / "a3m"
+            a3m_path = a3m_dir / f"{index}.a3m"
             a3m_dir.mkdir(parents=True, exist_ok=True)
-            with open(a3m_dir / f"{index}.a3m", "w") as f:
+            with open(a3m_path, "w") as f:
                 f.write(str(msa))
             updated_seqres_index_pairs.append((seqres, index))
         logger.info(f"[Batch {batch_ix}] Finished")
@@ -518,7 +632,9 @@ def batch_query(
 
 def cli(args):
     from confrover.data.msa.msa_loader import MSALoader, _load_seqres_index_pairs
+    from confrover.utils import attach_run_file_logging
 
+    attach_run_file_logging(Path(args.msa_root) / "logs", command="query_msa")
     logger.info(f"Will save MSA to: {args.msa_root}. Wait for 5 seconds...")
     time.sleep(5)
     msa_loader = MSALoader(msa_root=args.msa_root)
