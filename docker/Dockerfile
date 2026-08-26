@@ -23,21 +23,26 @@ FROM ${BASE}
 
 ARG COMMIT=unknown
 
+# Environment for the bootstrap (scripts/vast_bootstrap_pdbcluster.sh reads REPO,
+# DL, DATA, HF_REPO, WORKERS):
+# Environment the bootstrap reads (REPO, DL, DATA, HF_REPO, WORKERS) plus:
+#  - PIP_BREAK_SYSTEM_PACKAGES: the pytorch image installs torch into Ubuntu's system
+#    Python, which PEP 668 marks externally managed; in a container that is the
+#    environment we want.
+#  - REPO=/opt/ConfRover: code lives outside /workspace so mounting the data volume
+#    there cannot hide it.
+#  - WORKERS=8: a 6000 Pro host has the cores; 4 was the laptop's spawn-bound value.
+#  - expandable_segments: one validation pass walks several sequence lengths and the
+#    fused token axis is 9 x (L + L^2); without it the allocator accumulates every shape.
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
-    # The pytorch image installs torch into Ubuntu's system Python, which PEP 668
-    # marks externally managed; inside a container that is the environment we want.
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1 \
-    # Code lives outside /workspace so mounting the data volume there cannot
-    # hide it. scripts/vast_bootstrap_pdbcluster.sh reads these.
     REPO=/opt/ConfRover \
     DL=/workspace/hf_download \
     DATA=/workspace/confrover_data \
-    HF_REPO=AICanada/ConfRover-PDBcluster     # A 6000 Pro host has the cores; 4 was the laptop's spawn-bound value.
+    HF_REPO=AICanada/ConfRover-PDBcluster \
     WORKERS=8 \
-    # One validation pass walks several sequence lengths and the fused token axis
-    # is 9 x (L + L^2); without this the allocator accumulates every shape.
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     HF_HUB_ENABLE_HF_TRANSFER=0
 
