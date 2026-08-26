@@ -38,7 +38,17 @@ archs = torch.cuda.get_arch_list()
 free, total = torch.cuda.mem_get_info()
 print(f"gpu: {name}  sm_{major}{minor}  {total/2**30:.0f} GiB ({free/2**30:.0f} free)")
 print(f"torch {torch.__version__}  cuda {torch.version.cuda}  kernels for: {', '.join(archs)}")
-if f"sm_{major}{minor}" not in archs and f"compute_{major}{minor}" not in archs:
+def _ok(arch):
+    # SASS built for sm_XY runs on any device of the same major with minor >= Y;
+    # PTX (compute_XY) JIT-compiles on anything with capability >= XY.
+    kind, _, cap = arch.partition("_")
+    if not cap.isdigit():
+        return False
+    a_major, a_minor = int(cap[:-1]), int(cap[-1])
+    if kind == "sm":
+        return a_major == major and a_minor <= minor
+    return (a_major, a_minor) <= (major, minor)
+if not any(_ok(a) for a in archs):
     sys.exit(f"torch in this image has no kernels for sm_{major}{minor}; rebuild with a CUDA "
              f"{'13.0' if major >= 10 else '12.x'} base (see docker/Dockerfile ARG BASE)")
 torch.ones(1, device="cuda").mul_(2)
