@@ -2242,3 +2242,27 @@ def test_ckpt_prefix_rejects_tokens_the_name_parsers_cannot_split(bad: str):
 def test_the_catalog_header_names_the_corpus(overrides, label):
     """'Load DPF catalog' over a PDB-cluster run is wrong on its face."""
     assert train_cli._corpus_label(make_args(**overrides)) == label
+
+
+@pytest.mark.parametrize(
+    "member,label",
+    [
+        ({"member_id": "1abc_A", "pdb_path": "/workspace/confrover_data/pdbc/fam/1abc_A.pdb"}, "PDB clusters"),
+        ({"member_id": "t1", "xtc_path": "/workspace/confrover_data/dpf/fam/t1.xtc",
+          "xtc_top_pdb": "/workspace/confrover_data/dpf/fam/t1.pdb"}, "DPF"),
+    ],
+)
+def test_an_uninformative_catalog_path_is_resolved_from_its_members(tmp_path, member, label):
+    """On the instance the staged payload is <remote_root>/catalog.json: nothing in
+    the path says which corpus it is, so the first cloud run logged
+    'Load DPF catalog' over 1,678 PDB clusters. The members know."""
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({"families": [{"family_id": "fam", "members": [member]}]}))
+    assert train_cli._corpus_label(make_args(catalog=str(catalog))) == label
+
+
+def test_a_missing_or_malformed_catalog_does_not_break_the_header(tmp_path):
+    assert train_cli._corpus_label(make_args(catalog=str(tmp_path / "absent.json"))) == "DPF"
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert train_cli._corpus_label(make_args(catalog=str(bad))) == "DPF"

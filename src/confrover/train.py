@@ -1330,13 +1330,26 @@ def _corpus_label(args: argparse.Namespace) -> str:
 
     The family-store machinery is shared, but the corpora are not the same
     thing: ATLAS Dual Personality Fragments versus RCSB 95%-identity PDB
-    clusters. The source path says which one this run reads.
+    clusters. The source path usually says which one this run reads; when it
+    does not (a staged payload is just ``<remote_root>/catalog.json``), the
+    catalog's members do: PDB-cluster members are single structures with a
+    ``pdb_path``, DPF members are trajectories with an ``xtc_path``.
     """
-    source = str(
-        getattr(args, "catalog", None) or getattr(args, "dpf_root", None) or ""
-    )
+    catalog = getattr(args, "catalog", None)
+    source = str(catalog or getattr(args, "dpf_root", None) or "")
     source = source.replace("\\", "/").lower()
     if "pdb_cluster" in source or "/pdbc" in source or "pdbc95" in source:
+        return "PDB clusters"
+    if "dpf" in source or not catalog:
+        return "DPF"
+    try:
+        raw = json.loads(Path(catalog).read_text(encoding="utf-8"))
+        member = next(
+            m for f in raw.get("families", []) for m in f.get("members", [])
+        )
+    except (OSError, ValueError, StopIteration, AttributeError):
+        return "DPF"
+    if member.get("pdb_path") and not member.get("xtc_path"):
         return "PDB clusters"
     return "DPF"
 
