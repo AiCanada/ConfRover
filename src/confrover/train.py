@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import platform
@@ -1272,12 +1273,46 @@ class TflopReport(Callback):
                 f"({status['error']}); install triton (Linux) or triton-windows. "
                 "ATen ops still count; Triton kernels will show as 0 TFLOP."
             )
-        try:
-            by_task = measure_train_step_tflops_by_task(
-                pl_module, seqlen=self.probe_seqlen, window_frames=self.window_frames
-            )
-        except Exception as exc:
-            log.warning(f"Could not measure train-step TFLOP: {exc}")
+        # FlopCounterMode keeps the checkpointed trunk's activations, so the
+        # probe needs ~4x the memory of the same plain step (41.7 vs 10.2 GiB
+        # at L=150, 9 frames) and grows with L^2. Start from an empty allocator
+        # and, on OOM, step down the length ladder rather than give up: the
+        # figure is an estimate quoted "@L<probe>" either way, and the DPF
+        # median (L~250) blew a 95 GiB card where the cluster median (L=150) fit.
+        on_cuda = next(pl_module.parameters()).device.type == "cuda"
+        ladder = [int(self.probe_seqlen)] + [
+            L for L in (150, 100, 64) if L < int(self.probe_seqlen)
+        ]
+        by_task = None
+        last_error: Exception | None = None
+        for seqlen in ladder:
+            if on_cuda:
+                gc.collect()
+                torch.cuda.empty_cache()
+            try:
+                by_task = measure_train_step_tflops_by_task(
+                    pl_module, seqlen=seqlen, window_frames=self.window_frames
+                )
+            except Exception as exc:  # OOM (torch.OutOfMemoryError) or anything else
+                last_error = exc
+                if "out of memory" not in str(exc).lower():
+                    break
+                log.info(
+                    f"TFLOP probe at L={seqlen} ran out of memory; trying a shorter length"
+                )
+                if on_cuda:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                continue
+            if seqlen != int(self.probe_seqlen):
+                log.info(
+                    f"TFLOP probe measured at L={seqlen} (median L={self.probe_seqlen} "
+                    "did not fit); step costs are quoted at that length"
+                )
+            self.probe_seqlen = seqlen
+            break
+        if by_task is None:
+            log.warning(f"Could not measure train-step TFLOP: {last_error}")
             return
         pl_module.tflops_by_task = by_task
         # tflops_per_batch stays the iid figure for compatibility; the heartbeat
@@ -1568,14 +1603,19 @@ def run_train(args: argparse.Namespace) -> None:
         MetricsHandler(**_METRICS_HANDLER_EXTRAS),
         graceful_stop,
         ReleaseValidationMemory(),
+        # TFLOP probe first: under FlopCounterMode the checkpointed trunk keeps
+        # its activations (41.7 GiB at L=150 for a 9-frame window, against
+        # 10.2 GiB for the same plain step), so it wants the allocator empty --
+        # after the capacity-repair probe at the DPF median length it ran out
+        # of memory on a 95 GiB card.
+        TflopReport(
+            probe_seqlen=_median_train_seqlen(catalog, split),
+            window_frames=max(1, int(args.window_frames)),
+        ),
         SaturatedAttentionRescale(
             n_probe_batches=args.rescale_attention,
             seqlen=_median_train_seqlen(catalog, split),
             split_dead_units=bool(args.split_dead_units),
-        ),
-        TflopReport(
-            probe_seqlen=_median_train_seqlen(catalog, split),
-            window_frames=max(1, int(args.window_frames)),
         ),
         StepHeartbeat(every_n_steps=args.log_every_n_steps),
         _build_model_checkpoint(output_dir, args),

@@ -2280,3 +2280,48 @@ def test_a_missing_or_malformed_catalog_does_not_break_the_header(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json")
     assert train_cli._corpus_label(make_args(catalog=str(bad))) == "DPF"
+
+
+def test_tflop_probe_steps_down_the_length_ladder_on_oom(monkeypatch, caplog):
+    """Under FlopCounterMode the checkpointed trunk keeps its activations, so the
+    probe needs ~4x a plain step and grows with L^2: at the DPF median (L~250,
+    9 frames) it ran a 95 GiB card out of memory and the run lost its TFLOP
+    figures. It now retries at shorter lengths and quotes the one that fit."""
+    calls = []
+
+    def fake_measure(pl_module, *, seqlen, window_frames):
+        calls.append(seqlen)
+        if seqlen > 150:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 274.00 MiB")
+        return {"iid": 3.18, "forward": 13.01}
+
+    monkeypatch.setattr(train_cli, "measure_train_step_tflops_by_task", fake_measure)
+    monkeypatch.setattr(train_cli, "triton_status", lambda: {"available": True, "version": "x"})
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.zeros(1))
+
+    module = _Module()
+    cb = train_cli.TflopReport(probe_seqlen=250, window_frames=9)
+    with caplog.at_level(logging.INFO):
+        cb.on_fit_start(trainer=None, pl_module=module)
+    assert calls == [250, 150]
+    assert cb.probe_seqlen == 150 and module.tflops_probe_seqlen == 150
+    assert module.tflops_by_task == {"iid": 3.18, "forward": 13.01}
+    assert "did not fit" in caplog.text
+
+
+def test_tflop_probe_gives_up_on_a_non_memory_error(monkeypatch, caplog):
+    def fake_measure(pl_module, *, seqlen, window_frames):
+        raise RuntimeError("no Triton")
+
+    monkeypatch.setattr(train_cli, "measure_train_step_tflops_by_task", fake_measure)
+    monkeypatch.setattr(train_cli, "triton_status", lambda: {"available": True, "version": "x"})
+    module = torch.nn.Linear(1, 1)
+    cb = train_cli.TflopReport(probe_seqlen=250, window_frames=9)
+    with caplog.at_level(logging.WARNING):
+        cb.on_fit_start(trainer=None, pl_module=module)
+    assert "Could not measure train-step TFLOP: no Triton" in caplog.text
+    assert not hasattr(module, "tflops_by_task")
