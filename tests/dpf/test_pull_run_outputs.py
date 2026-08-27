@@ -176,7 +176,10 @@ def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_window
     assert 'WINDOW="${WINDOW:-9}"' in text and 'ONE_PASS="${ONE_PASS:-true}"' in text
     assert 'IID_STRIDE="${IID_STRIDE:-4}"' in text and 'MAX_EPOCHS="${MAX_EPOCHS:-90}"' in text
     assert "--ckpt_prefix dpf" in text
-    assert '--exclude "run/checkpoints/*"' in text, "v888's seed checkpoint must not be resumed"
+    # v888's seed checkpoint (run/checkpoints/*) is in the payload manifest, so it
+    # is downloaded for the verify step -- but never copied into $RUN, where
+    # --resume auto would otherwise continue v888 instead of starting from $WEIGHTS.
+    assert '--exclude "run/checkpoints/*"' not in text
     assert 'cp -n "$DATA/run/splits/0.json"' in text and 'cp -rn "$DATA/run/."' not in text
     assert 'pgrep -f "confrover train"' in text, "never repoint the data symlink under a running run"
     assert 'HF_SYNC="${HF_SYNC:-0}"' in text and "pull_run_outputs.py" in text

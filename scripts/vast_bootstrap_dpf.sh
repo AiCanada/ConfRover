@@ -89,9 +89,11 @@ pip install -q -e .
 
 say "2/6  download payload $HF_REPO -> $DL"
 # ~43 GiB in ~580 large files (no hub rate-limit issue). run/checkpoints/* is the
-# v888 run's own seed checkpoint; this run starts from $WEIGHTS, not from it.
+# v888 run's own seed checkpoint (225 MB): this run starts from $WEIGHTS, not from
+# it, but the payload manifest lists it, so it is fetched for step 3 and simply
+# never copied into $RUN. checkpoints/* is the archive v888 wrote; not needed.
 hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --max-workers "${HF_WORKERS:-8}" \
-  --exclude "run/checkpoints/*" --exclude "checkpoints/*"
+  --exclude "checkpoints/*"
 
 if [[ ! -f "$WEIGHTS" ]]; then
   echo "stage-1 weights not at $WEIGHTS; fetching $WEIGHTS_REPO/$WEIGHTS_PATH_IN_REPO"
