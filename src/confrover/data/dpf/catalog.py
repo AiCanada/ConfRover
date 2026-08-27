@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from dataclasses import dataclass, field
@@ -29,6 +30,21 @@ from confrover.data.io.pdb import assert_atom37_indexable
 
 logger = logging.getLogger(__name__)
 PathLike = Union[str, Path]
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def _resolved_path_str(path: str) -> str:
+    """``str(Path(path).resolve())``, memoised.
+
+    ``structure_key`` is asked for every frame of every window the bag builder
+    creates, and a corpus has only a few hundred distinct files: on the first
+    DPF run with 9-frame windows at ``--iid_frame_stride 4`` (~70,000 windows
+    per family) the un-memoised realpath syscall ran ~80 million times per bag
+    rebuild -- the trainer sat at 100% CPU for tens of minutes before its first
+    step, and every epoch boundary (parent and each worker) would have repeated
+    it. Paths do not change identity within a process.
+    """
+    return str(Path(path).resolve())
 
 _SEQRES_FILENAMES = ("seqres.txt", "seq.txt", "sequence.txt")
 _FASTA_FILENAMES = ("seq.fasta", "seqres.fasta", "sequence.fasta")
@@ -91,16 +107,16 @@ class DpfMember:
     def structure_key(self) -> tuple[str, str]:
         """On-disk identity for leak checks. One XTC path is one key."""
         if self.xtc_path is not None:
-            return ("xtc", str(Path(self.xtc_path).resolve()))
+            return ("xtc", _resolved_path_str(str(self.xtc_path)))
         assert self.pdb_path is not None
-        return ("pdb", str(Path(self.pdb_path).resolve()))
+        return ("pdb", _resolved_path_str(str(self.pdb_path)))
 
     def containment_keys(self) -> list[tuple[str, str]]:
         """All grouping keys that must stay on one side of a split."""
         keys = [self.structure_key()]
         if self.xtc_top_pdb is not None:
-            keys.append(("pdb", str(Path(self.xtc_top_pdb).resolve())))
-        path = Path(self.xtc_path or self.pdb_path).resolve()
+            keys.append(("pdb", _resolved_path_str(str(self.xtc_top_pdb))))
+        path = Path(_resolved_path_str(str(self.xtc_path or self.pdb_path)))
         if path.parent.name in {"protein", "analysis"}:
             keys.append(("family_dir", str(path.parent.parent)))
         return keys

@@ -738,3 +738,24 @@ def test_unchecked_load_warns_that_nothing_was_verified(
     with caplog.at_level("WARNING"):
         DpfSplit.load(path, catalog=toy_catalog)
     assert "without checking it against any requested split config" in caplog.text
+
+
+def test_structure_key_resolves_each_path_once(tmp_path):
+    """The bag builder asks for structure_key on every frame of every window.
+    On the first DPF run with 9-frame windows at --iid_frame_stride 4 (~70,000
+    windows per family) the unmemoised realpath syscall ran ~80 million times
+    per bag rebuild and the trainer sat at 100% CPU for tens of minutes before
+    its first step. A corpus has a few hundred distinct files; resolve each once."""
+    from confrover.data.dpf import catalog as cat_mod
+    from confrover.data.dpf.catalog import DpfMember
+
+    pdb = tmp_path / "1abc_A.pdb"
+    pdb.write_text("ATOM\n")
+    member = DpfMember(member_id="1abc_A", pdb_path=str(pdb))
+    cat_mod._resolved_path_str.cache_clear()
+    first = member.structure_key()
+    for _ in range(10_000):
+        assert member.structure_key() == first
+    info = cat_mod._resolved_path_str.cache_info()
+    assert info.misses == 1 and info.hits == 10_000
+    assert first == ("pdb", str(pdb.resolve()))
