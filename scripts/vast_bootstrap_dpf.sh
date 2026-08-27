@@ -205,5 +205,5 @@ confrover train "${DATA_FLAGS[@]}" \
   --max_epochs "$MAX_EPOCHS" \
   --accumulate_grad_batches 1 --grad_clip 1.0 \
   --rescale_attention 8 \
-  --ckpt_every_n_steps 500 --val_every_n_steps 200 --log_every_n_steps 10 \
+  --ckpt_every_n_steps 500 --val_every_n_steps 500 --log_every_n_steps 10 \
   --resume auto
