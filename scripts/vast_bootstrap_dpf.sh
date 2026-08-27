@@ -122,6 +122,15 @@ echo "$DATA -> $(readlink -f "$DATA")"
 mkdir -p "$RUN/splits"
 cp -n "$DATA/run/splits/0.json" "$RUN/splits/0.json"
 ls -la "$RUN/splits"
+# Hard guarantee, not a convention: a fresh run (no manifest yet) must have an
+# empty checkpoint directory, so nothing but $WEIGHTS can be the starting point.
+if [[ ! -f "$RUN/run_manifest.json" ]] && [[ -n "$(ls -A "$RUN/checkpoints" 2>/dev/null)" ]]; then
+  echo "ERROR: $RUN/checkpoints is not empty on a fresh run; --resume auto would start" >&2
+  echo "       from it instead of $WEIGHTS. Remove it or pick another RUN_NAME." >&2
+  ls -la "$RUN/checkpoints" >&2
+  exit 1
+fi
+echo "fresh run: starts from $WEIGHTS; $DATA/run/checkpoints (v888's seed) is not used"
 
 say "3/6  verify payload"
 python "$REPO/scripts/verify_remote_payload.py" --root "$DATA"

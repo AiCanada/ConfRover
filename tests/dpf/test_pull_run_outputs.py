@@ -180,6 +180,7 @@ def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_window
     # is downloaded for the verify step -- but never copied into $RUN, where
     # --resume auto would otherwise continue v888 instead of starting from $WEIGHTS.
     assert '--exclude "run/checkpoints/*"' not in text
+    assert 'ls -A "$RUN/checkpoints"' in text, "a fresh run refuses a pre-populated checkpoint dir"
     assert 'cp -n "$DATA/run/splits/0.json"' in text and 'cp -rn "$DATA/run/."' not in text
     assert 'pgrep -f "confrover train"' in text, "never repoint the data symlink under a running run"
     assert 'HF_SYNC="${HF_SYNC:-0}"' in text and "pull_run_outputs.py" in text
