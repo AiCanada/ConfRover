@@ -113,7 +113,8 @@ for name in $HF_BUNDLES; do
     tar -xzf "$DL/$rel" -C "$PAYLOAD"
     EXCLUDES+=(--exclude "${HF_SUBDIR:+$HF_SUBDIR/}$name/*")
   else
-    echo "bundle $name: not available ($(printf '%s' "$out" | tail -1)); per-file download"
+    # the CLI's last line is a generic "set HF_DEBUG=1" hint; the reason is above it
+    echo "bundle $name: not available ($(printf '%s' "$out" | grep -v "HF_DEBUG" | tail -1)); per-file download"
   fi
 done
 if [[ -n "$HF_SUBDIR" ]]; then
