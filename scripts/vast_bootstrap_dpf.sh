@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# DPF fine-tune ON TOP OF the PDB-cluster stage, on a vast.ai instance.
+#
+# Stage 2 of the two-stage recipe: start from the weights the PDB-cluster run
+# exported (confrover_base_PDBcluster.pt = end of its last epoch), train the
+# ATLAS Dual Personality Fragments with the same 9-frame windows and the same
+# no-reuse rule (--one_pass_frames), for 90 epochs.
+#
+#   install -> download -> verify (fingerprint!) -> smoke -> [sync watcher] -> train
+#
+# Data: the v888 payload in $HF_REPO (AICanada/H.U.M.A.N): 86 DPF families
+# (100 minus the 14 in the base model's own ATLAS training set), 3 replicas of
+# 10,001 frames each, OpenFold reprs, the 76/5/5 split. Its catalog.json has
+# /workspace/confrover_data baked in -- the same path the cluster payload used --
+# so step 2 repoints that symlink, and refuses to while any training is running.
+# None of the 86 families (nor their PDB entries) is a member of any cluster in
+# the stage-1 catalog: the two stages share no protein.
+#
+# Checkpoints: by default they stay on the box for scripts/pull_run_outputs.py
+# (run on the laptop) to fetch and prune. HF_SYNC=1 additionally runs the Hub
+# watcher into $HF_SYNC_REPO/checkpoints/$RUN_NAME.
+#
+# No reuse, sized for 90 epochs: with W=9 a trajectory family draws 8 iid windows
+# (72 frames) and 8 forward windows per epoch. At --iid_frame_stride 41 the iid
+# pool is 30,003/41 = 731 frames, exhausted after epoch 10, after which the run
+# is forward-only; at stride 4 it is 7,500 frames, enough for 104 epochs. Forward
+# windows (every 9-frame window of a replica at ladder strides 1..1024, starts
+# every iid_frame_stride) number in the tens of thousands per family either way.
+#
+# Usage:  HF_TOKEN=... bash scripts/vast_bootstrap_dpf.sh [--train]
+#         Without --train it stops after the 6-step smoke, when mem= and s/step
+#         on this card are known.
+
+set -euo pipefail
+
+REPO="${REPO:-/workspace/ConfRover}"
+RUN_NAME="${RUN_NAME:-dpf_from_PDBcluster}"
+HF_REPO="${HF_REPO:-AICanada/H.U.M.A.N}"           # the DPF payload
+DL="${DL:-/workspace/hf_dpf}"                        # where it is downloaded
+DATA="${DATA:-/workspace/confrover_data}"            # baked into catalog.json
+RUN="${RUN:-/workspace/runs/$RUN_NAME}"
+# Stage-1 output. Falls back to the copy the cluster run pushed to the Hub.
+WEIGHTS="${WEIGHTS:-/workspace/runs/PDBcluster_from_base/confrover_base_PDBcluster.pt}"
+WEIGHTS_REPO="${WEIGHTS_REPO:-AICanada/ConfRover-PDBcluster}"
+WEIGHTS_PATH_IN_REPO="${WEIGHTS_PATH_IN_REPO:-checkpoints/PDBcluster_from_base/confrover_base_PDBcluster.pt}"
+
+WORKERS="${WORKERS:-8}"
+WINDOW="${WINDOW:-9}"
+ONE_PASS="${ONE_PASS:-true}"
+IID_STRIDE="${IID_STRIDE:-4}"
+MAX_EPOCHS="${MAX_EPOCHS:-90}"
+HF_SYNC="${HF_SYNC:-0}"
+HF_SYNC_REPO="${HF_SYNC_REPO:-AICanada/ConfRover-PDBcluster}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+TF32="${TF32:-0}"
+
+TRAIN=0
+[[ "${1:-}" == "--train" ]] && TRAIN=1
+
+say() { printf '\n=== %s ===\n' "$1"; }
+
+say "1/6  environment"
+python -V
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+if [[ "$GPU_NAME" == *"Max-Q"* ]]; then
+  echo "WARNING: $GPU_NAME is the power-limited variant; WS / Server Edition is faster"
+  echo "         for the same VRAM."
+fi
+if [[ "$TF32" == "1" ]]; then
+  export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+  echo "TF32 ON (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1)"
+fi
+echo "run=$RUN_NAME  window=$WINDOW  one_pass=$ONE_PASS  iid_stride=$IID_STRIDE  max_epochs=$MAX_EPOCHS  workers=$WORKERS  hf_sync=$HF_SYNC  tf32=$TF32"
+echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+: "${HF_TOKEN:?export HF_TOKEN (read on $HF_REPO and $WEIGHTS_REPO)}"
+pip install -q "huggingface_hub>=0.23"
+if [[ ! -d "$REPO" ]]; then
+  echo "no checkout at $REPO; fetching code/ConfRover.tar.gz from $WEIGHTS_REPO"
+  hf download "$WEIGHTS_REPO" code/ConfRover.tar.gz --repo-type dataset --local-dir "$DL"
+  mkdir -p "$REPO" && tar -xzf "$DL/code/ConfRover.tar.gz" -C "$REPO"
+fi
+cd "$REPO"
+[[ -f COMMIT ]] && echo "code commit: $(cat COMMIT)"
+pip install -q -e .
+
+say "2/6  download payload $HF_REPO -> $DL"
+# ~43 GiB in ~580 large files (no hub rate-limit issue). run/checkpoints/* is the
+# v888 run's own seed checkpoint; this run starts from $WEIGHTS, not from it.
+hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --max-workers "${HF_WORKERS:-8}" \
+  --exclude "run/checkpoints/*" --exclude "checkpoints/*"
+
+if [[ ! -f "$WEIGHTS" ]]; then
+  echo "stage-1 weights not at $WEIGHTS; fetching $WEIGHTS_REPO/$WEIGHTS_PATH_IN_REPO"
+  hf download "$WEIGHTS_REPO" "$WEIGHTS_PATH_IN_REPO" --repo-type dataset --local-dir "$DL/stage1"
+  WEIGHTS="$DL/stage1/$WEIGHTS_PATH_IN_REPO"
+fi
+test -f "$WEIGHTS" || { echo "missing weights: $WEIGHTS" >&2; exit 1; }
+echo "start weights: $WEIGHTS ($(du -h "$WEIGHTS" | cut -f1))"
+
+# catalog.json expects the payload at $DATA. Repoint the symlink -- never while a
+# training process could still be reading through it.
+if pgrep -f "confrover train" > /dev/null; then
+  echo "ERROR: a 'confrover train' process is running; not touching $DATA." >&2
+  exit 1
+fi
+if [[ -L "$DATA" || ! -e "$DATA" ]]; then
+  ln -sfn "$DL" "$DATA"
+elif [[ "$(readlink -f "$DATA")" != "$(readlink -f "$DL")" ]]; then
+  echo "ERROR: $DATA is a real directory that is not the DPF payload; catalog.json expects the payload there." >&2
+  exit 1
+fi
+echo "$DATA -> $(readlink -f "$DATA")"
+
+# Only the split. run/checkpoints (v888's seed) must not land in $RUN, or
+# --resume auto would continue v888 instead of starting from $WEIGHTS.
+mkdir -p "$RUN/splits"
+cp -n "$DATA/run/splits/0.json" "$RUN/splits/0.json"
+ls -la "$RUN/splits"
+
+say "3/6  verify payload"
+python "$REPO/scripts/verify_remote_payload.py" --root "$DATA"
+
+DATA_FLAGS=(
+  --catalog "$DATA/catalog.json"
+  --split_file "$RUN/splits/0.json"
+  --cache_dir "$DATA"
+  --folding_repr "$DATA/folding_repr"
+  --model "$WEIGHTS"
+  --ckpt_prefix dpf
+  --window_frames "$WINDOW"
+  --one_pass_frames "$ONE_PASS"
+  --tasks iid,forward
+  --iid_frame_stride "$IID_STRIDE"
+  --forward_stride_frames 1-1024
+  --samples_per_family 8
+  --max_seqlen 384
+  --family_excludelist auto
+  --split_seed 0 --n_holdout 5 --n_val 5
+  --seed 42
+  --precision 32-true --batch_size 1 --num_data_workers "$WORKERS"
+  --repr_cache_size 128
+)
+
+say "4/6  smoke: 6 real steps on this card"
+SMOKE="${SMOKE:-/workspace/smoke_dpf}"
+rm -rf "$SMOKE" && mkdir -p "$SMOKE"
+python -c "
+import torch
+print('device:', torch.cuda.get_device_name(0))
+free, total = torch.cuda.mem_get_info()
+print(f'VRAM: {total/2**30:.1f} GiB total, {free/2**30:.1f} GiB free')
+print('stage 1 (9-frame windows, L<=384) peaked at 76.5 GiB allocated on a 95 GiB card')
+"
+confrover train "${DATA_FLAGS[@]}" \
+  --output "$SMOKE" \
+  --max_steps 6 --val_every_n_steps 0 --log_every_n_steps 1 \
+  --ckpt_every_n_steps 0 --resume none --rescale_attention 8
+echo "Check mem=allocated/reserved and s/step above before renting on."
+
+say "5/6  checkpoint sync"
+if [[ "$HF_SYNC" == "1" ]]; then
+  if pgrep -f "sync_checkpoints_hf.py --ckpt_dir $RUN/checkpoints" > /dev/null; then
+    echo "sync watcher already running -> $RUN/sync_hf.log"
+  else
+    nohup python "$REPO/scripts/sync_checkpoints_hf.py" \
+        --ckpt_dir "$RUN/checkpoints" \
+        --repo_id "$HF_SYNC_REPO" --repo_type dataset --prefix "checkpoints/$RUN_NAME" \
+        --watch --interval 900 --prune \
+        >> "$RUN/sync_hf.log" 2>&1 &
+    echo "sync watcher pid $! -> $RUN/sync_hf.log"
+  fi
+else
+  echo "HF sync off (HF_SYNC=0): checkpoints stay in $RUN/checkpoints for"
+  echo "  scripts/pull_run_outputs.py --remote_run $RUN ... --watch --prune   (run on the laptop)"
+fi
+
+if [[ $TRAIN -eq 0 ]]; then
+  say "stopping before training"
+  echo "Numbers are in. Re-run with --train to start, or destroy the instance."
+  exit 0
+fi
+
+say "6/6  train"
+# The v888 optimisation recipe; --resume auto so the same command continues a
+# stopped run. Every knob that shapes the sampling bag is in DATA_FLAGS above.
+confrover train "${DATA_FLAGS[@]}" \
+  --output "$RUN" \
+  --lr 1e-4 --lr_schedule cosine --lr_warmup_steps 50 --lr_min_ratio 0.1 \
+  --weight_decay 0.0 --tmin 0.01 --tmax 1.0 \
+  --max_epochs "$MAX_EPOCHS" \
+  --accumulate_grad_batches 1 --grad_clip 1.0 \
+  --rescale_attention 8 \
+  --ckpt_every_n_steps 500 --val_every_n_steps 200 --log_every_n_steps 10 \
+  --resume auto

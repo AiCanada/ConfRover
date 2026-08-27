@@ -1,0 +1,177 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+
+"""The laptop-side checkpoint puller: what it fetches, what it verifies, what it
+may delete on the box. The transport is faked; the rules are what is tested."""
+
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path, PurePosixPath
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+pull = pytest.importorskip("pull_run_outputs")
+
+
+class _FakeBox:
+    """An instance's filesystem as {path: bytes}, with a corruptible fetch."""
+
+    def __init__(self, files: dict[str, bytes]):
+        self.files = dict(files)
+        self.deleted: list[str] = []
+        self.corrupt: set[str] = set()
+
+    def list_dir(self, remote_dir, maxdepth=1):
+        out = []
+        for path, data in self.files.items():
+            rel = PurePosixPath(path)
+            try:
+                parts = rel.relative_to(remote_dir).parts
+            except ValueError:
+                continue
+            if 1 <= len(parts) <= maxdepth:
+                out.append(pull.RemoteFile(path=path, size=len(data)))
+        return out
+
+    def fetch(self, remote_path, local_path: Path):
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        data = self.files[remote_path]
+        if remote_path in self.corrupt:
+            data = data[:-1]
+        local_path.write_bytes(data)
+
+    def sha256(self, remote_path):
+        return hashlib.sha256(self.files[remote_path]).hexdigest()
+
+    def delete(self, remote_path):
+        self.deleted.append(remote_path)
+        self.files.pop(remote_path, None)
+
+
+RUN = "/workspace/runs/dpf_from_PDBcluster"
+
+
+def _box(**extra) -> _FakeBox:
+    files = {
+        f"{RUN}/checkpoints/dpf-epoch000-step00000500.ckpt": b"a" * 500,
+        f"{RUN}/checkpoints/dpf-epoch000-step00000500.restart.json": b"{}",
+        f"{RUN}/checkpoints/dpf-bestfwd-step00000500.ckpt": b"b" * 500,
+        f"{RUN}/checkpoints/dpf-epoch000-end.ckpt": b"e" * 600,
+        f"{RUN}/checkpoints/dpf-epoch001-step00001000.ckpt": b"c" * 500,
+        f"{RUN}/checkpoints/dpf-epoch001-step00001500.ckpt": b"d" * 500,
+        f"{RUN}/checkpoints/last.ckpt": b"d" * 500,
+        f"{RUN}/checkpoints/restart.json": b"{}",
+        f"{RUN}/run_manifest.json": b'{"status": "training"}',
+        f"{RUN}/heldout_forward.json": b"[]",
+        f"{RUN}/logs/console.log": b"log",
+        f"{RUN}/splits/0.json": b"{}",
+    }
+    files.update(extra)
+    return _FakeBox(files)
+
+
+def test_prune_keeps_last_and_the_newest_step_numbers():
+    names = [
+        "dpf-epoch000-step00000500.ckpt", "dpf-epoch000-step00000500.restart.json",
+        "dpf-bestfwd-step00000500.ckpt", "dpf-epoch000-end.ckpt",
+        "dpf-epoch001-step00001000.ckpt", "dpf-epoch001-step00001500.ckpt",
+        "last.ckpt", "restart.json",
+    ]
+    assert pull.prune_candidates(names, keep_recent=2) == [
+        "dpf-bestfwd-step00000500.ckpt",
+        "dpf-epoch000-end.ckpt",
+        "dpf-epoch000-step00000500.ckpt",
+        "dpf-epoch000-step00000500.restart.json",
+    ]
+    assert pull.prune_candidates(names, keep_recent=0) == sorted(n for n in names if n not in ("last.ckpt", "restart.json"))
+
+
+def test_a_cycle_fetches_everything_then_prunes_only_what_is_local(tmp_path):
+    box = _box()
+    dest = tmp_path / "checkpoints"
+    result = pull.pull_once(box, RUN, dest, keep_recent=2, prune=True, log=lambda s: None)
+
+    assert sorted(p.name for p in dest.iterdir()) == sorted(
+        PurePosixPath(p).name for p in _box().files if "/checkpoints/" in p
+    )
+    other = tmp_path / "dpf_from_PDBcluster"
+    assert (other / "run_manifest.json").read_bytes() == b'{"status": "training"}'
+    assert (other / "logs" / "console.log").exists() and (other / "splits" / "0.json").exists()
+    assert (other / "heldout_forward.json").exists()
+
+    # pruned: everything local except last.ckpt/restart.json and steps 1000, 1500
+    assert sorted(PurePosixPath(p).name for p in box.deleted) == [
+        "dpf-bestfwd-step00000500.ckpt",
+        "dpf-epoch000-end.ckpt",
+        "dpf-epoch000-step00000500.ckpt",
+        "dpf-epoch000-step00000500.restart.json",
+    ]
+    assert f"{RUN}/checkpoints/last.ckpt" in box.files
+    assert result["failed"] == []
+    # local copies survive the prune
+    assert (dest / "dpf-epoch000-end.ckpt").read_bytes() == b"e" * 600
+
+
+def test_a_short_copy_is_discarded_and_never_licenses_a_prune(tmp_path):
+    box = _box()
+    box.corrupt.add(f"{RUN}/checkpoints/dpf-epoch000-end.ckpt")
+    dest = tmp_path / "checkpoints"
+    result = pull.pull_once(box, RUN, dest, keep_recent=2, prune=True, log=lambda s: None)
+    assert "dpf-epoch000-end.ckpt" in result["failed"]
+    assert not (dest / "dpf-epoch000-end.ckpt").exists()
+    assert f"{RUN}/checkpoints/dpf-epoch000-end.ckpt" in box.files, "the only good copy is on the box"
+    # the second cycle, with the box healthy again, completes it
+    box.corrupt.clear()
+    result = pull.pull_once(box, RUN, dest, keep_recent=2, prune=True, log=lambda s: None)
+    assert "dpf-epoch000-end.ckpt" in result["fetched"]
+    assert f"{RUN}/checkpoints/dpf-epoch000-end.ckpt" not in box.files
+
+
+def test_the_weights_export_is_verified_by_sha256(tmp_path):
+    export = f"{RUN}/confrover_base_dpf.pt"
+    box = _box(**{export: b"w" * 1000})
+    box.corrupt.add(export)  # same length would pass a size check; sha must catch it
+    box.files[export + ".pad"] = b""  # unrelated
+    dest = tmp_path / "checkpoints"
+    result = pull.pull_once(box, RUN, dest, keep_recent=2, prune=False, log=lambda s: None)
+    assert "confrover_base_dpf.pt" in result["failed"]
+    assert not (tmp_path / "dpf_from_PDBcluster" / "confrover_base_dpf.pt").exists()
+    box.corrupt.clear()
+    pull.pull_once(box, RUN, dest, keep_recent=2, prune=False, log=lambda s: None)
+    assert (tmp_path / "dpf_from_PDBcluster" / "confrover_base_dpf.pt").read_bytes() == b"w" * 1000
+
+
+def test_unchanged_files_are_not_refetched(tmp_path):
+    box = _box()
+    dest = tmp_path / "checkpoints"
+    pull.pull_once(box, RUN, dest, keep_recent=9, prune=False, log=lambda s: None)
+    calls = []
+    original = box.fetch
+
+    def counting_fetch(remote_path, local_path):
+        calls.append(remote_path)
+        original(remote_path, local_path)
+
+    box.fetch = counting_fetch
+    pull.pull_once(box, RUN, dest, keep_recent=9, prune=False, log=lambda s: None)
+    # logs are always refreshed (they grow); nothing else was touched
+    assert all(p.endswith(".log") for p in calls), calls
+
+
+def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_windows():
+    text = (REPO_ROOT / "scripts" / "vast_bootstrap_dpf.sh").read_text(encoding="utf-8")
+    assert "\r" not in text
+    assert 'WEIGHTS="${WEIGHTS:-/workspace/runs/PDBcluster_from_base/confrover_base_PDBcluster.pt}"' in text
+    assert 'WINDOW="${WINDOW:-9}"' in text and 'ONE_PASS="${ONE_PASS:-true}"' in text
+    assert 'IID_STRIDE="${IID_STRIDE:-4}"' in text and 'MAX_EPOCHS="${MAX_EPOCHS:-90}"' in text
+    assert "--ckpt_prefix dpf" in text
+    assert '--exclude "run/checkpoints/*"' in text, "v888's seed checkpoint must not be resumed"
+    assert 'cp -n "$DATA/run/splits/0.json"' in text and 'cp -rn "$DATA/run/."' not in text
+    assert 'pgrep -f "confrover train"' in text, "never repoint the data symlink under a running run"
+    assert 'HF_SYNC="${HF_SYNC:-0}"' in text and "pull_run_outputs.py" in text
