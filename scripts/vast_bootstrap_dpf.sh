@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # DPF fine-tune ON TOP OF the PDB-cluster stage, on a vast.ai instance.
 #
-# Stage 2 of the two-stage recipe: start from the weights the PDB-cluster run
-# exported (confrover_base_PDBcluster.pt = end of its last epoch), train the
+# Stage 2 of the two-stage recipe: start from the PDB-cluster run's best
+# checkpoint (confrover_base_PDBcluster_step8364.pt, its best val/forward), train the
 # ATLAS Dual Personality Fragments with the same 9-frame windows and the same
 # no-reuse rule (--one_pass_frames), for 90 epochs.
 #
@@ -39,10 +39,13 @@ HF_REPO="${HF_REPO:-AICanada/H.U.M.A.N}"           # the DPF payload
 DL="${DL:-/workspace/hf_dpf}"                        # where it is downloaded
 DATA="${DATA:-/workspace/confrover_data}"            # baked into catalog.json
 RUN="${RUN:-/workspace/runs/$RUN_NAME}"
-# Stage-1 output. Falls back to the copy the cluster run pushed to the Hub.
-WEIGHTS="${WEIGHTS:-/workspace/runs/PDBcluster_from_base/confrover_base_PDBcluster.pt}"
+# Stage-1 output: the best-val/forward checkpoint (step 8364, val fwd 0.5408),
+# exported with scripts/export_finetuned_weights.py. The end-of-run export
+# (confrover_base_PDBcluster.pt, step 8409) is the alternative. Falls back to
+# the copy the cluster run pushed to the Hub.
+WEIGHTS="${WEIGHTS:-/workspace/runs/PDBcluster_from_base/confrover_base_PDBcluster_step8364.pt}"
 WEIGHTS_REPO="${WEIGHTS_REPO:-AICanada/ConfRover-PDBcluster}"
-WEIGHTS_PATH_IN_REPO="${WEIGHTS_PATH_IN_REPO:-checkpoints/PDBcluster_from_base/confrover_base_PDBcluster.pt}"
+WEIGHTS_PATH_IN_REPO="${WEIGHTS_PATH_IN_REPO:-checkpoints/PDBcluster_from_base/confrover_base_PDBcluster_step8364.pt}"
 
 WORKERS="${WORKERS:-8}"
 WINDOW="${WINDOW:-9}"

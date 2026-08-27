@@ -167,7 +167,12 @@ def test_unchanged_files_are_not_refetched(tmp_path):
 def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_windows():
     text = (REPO_ROOT / "scripts" / "vast_bootstrap_dpf.sh").read_text(encoding="utf-8")
     assert "\r" not in text
-    assert 'WEIGHTS="${WEIGHTS:-/workspace/runs/PDBcluster_from_base/confrover_base_PDBcluster.pt}"' in text
+    assert 'WEIGHTS="${WEIGHTS:-/workspace/runs/PDBcluster_from_base/confrover_base_PDBcluster_step8364.pt}"' in text
+    # the export of the best-forward checkpoint is named so the weight-family
+    # policy accepts it (confrover_base_<prefix>): see train_policy._OWN_FINETUNE_RE
+    from confrover.train_policy import is_base_weight_family
+
+    assert is_base_weight_family("confrover_base_PDBcluster_step8364.pt")
     assert 'WINDOW="${WINDOW:-9}"' in text and 'ONE_PASS="${ONE_PASS:-true}"' in text
     assert 'IID_STRIDE="${IID_STRIDE:-4}"' in text and 'MAX_EPOCHS="${MAX_EPOCHS:-90}"' in text
     assert "--ckpt_prefix dpf" in text
