@@ -77,8 +77,14 @@ def remote_sizes(api: HfApi, repo_id: str, repo_type: str, prefix: str) -> dict[
     own answer before anything is deleted locally.
     """
     try:
-        entries = api.list_repo_tree(
-            repo_id=repo_id, repo_type=repo_type, path_in_repo=prefix, recursive=True
+        # list() inside the try: list_repo_tree is a generator and the request
+        # (and its 404 for a prefix nothing has been uploaded to yet) happens on
+        # iteration. Caught only at the call, the first sync of every run failed
+        # on "does not exist" and retried every 900 s without ever uploading.
+        entries = list(
+            api.list_repo_tree(
+                repo_id=repo_id, repo_type=repo_type, path_in_repo=prefix, recursive=True
+            )
         )
     except HfHubHTTPError:
         return {}

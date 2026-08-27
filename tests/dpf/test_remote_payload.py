@@ -534,3 +534,20 @@ def test_watch_mode_waits_for_the_directory_instead_of_exiting(tmp_path, monkeyp
     with pytest.raises(Reached):
         sync_checkpoints_hf.main()
     assert "Waiting for" in capsys.readouterr().err
+
+
+def test_a_prefix_nothing_was_uploaded_to_yet_reads_as_empty(monkeypatch):
+    """list_repo_tree is a generator: the request, and its 404 for a folder
+    that does not exist yet, happen on iteration. On the first cloud run the
+    watcher failed every cycle with 'does not exist on main' and never uploaded."""
+
+    class LazyMissing:
+        def list_repo_tree(self, **_):
+            def gen():
+                raise RuntimeError("404 Client Error: checkpoints/x does not exist on main")
+                yield  # pragma: no cover
+
+            return gen()
+
+    monkeypatch.setattr(sync_checkpoints_hf, "HfHubHTTPError", RuntimeError)
+    assert sync_checkpoints_hf.remote_sizes(LazyMissing(), "u/r", "dataset", "checkpoints/x") == {}
