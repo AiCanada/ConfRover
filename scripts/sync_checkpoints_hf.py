@@ -158,6 +158,12 @@ def push_once(
     return uploaded, freed
 
 
+def wait_for_dir(path: Path, interval: float = 30.0, sleep=time.sleep) -> None:
+    """Block until ``path`` is a directory, polling every ``interval`` seconds."""
+    while not path.is_dir():
+        sleep(interval)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -203,8 +209,14 @@ def main() -> int:
 
     ckpt_dir: Path = args.ckpt_dir.resolve()
     if not ckpt_dir.is_dir():
-        print(f"Not a directory: {ckpt_dir}", file=sys.stderr)
-        return 1
+        if not args.watch:
+            print(f"Not a directory: {ckpt_dir}", file=sys.stderr)
+            return 1
+        # The bootstrap starts the watcher before training, and Lightning only
+        # creates <run>/checkpoints at the first save: on the first cloud run both
+        # watchers exited here within a second and nothing was ever synced.
+        print(f"Waiting for {ckpt_dir} to appear (first checkpoint)...", file=sys.stderr)
+        wait_for_dir(ckpt_dir)
 
     # Local run output stays in the local folder; cloud run output goes to the Hub.
     # Pruning only makes sense on the rented box, where a deleted local copy frees

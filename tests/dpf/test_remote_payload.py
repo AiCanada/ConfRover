@@ -491,3 +491,46 @@ def test_bootstrap_prefers_bundles_and_excludes_them_from_the_snapshot():
     # the staging wrapper actually produces the bundle the bootstrap looks for
     ps1 = (REPO_ROOT / "runsPDB" / "stage_PDBcluster_payload.ps1").read_text(encoding="utf-8")
     assert "--bundle pdbc" in ps1
+
+
+# --- the watcher must outlive the moment the checkpoint dir appears ------------
+
+
+def test_wait_for_dir_polls_until_the_directory_exists(tmp_path):
+    target = tmp_path / "checkpoints"
+    calls = []
+
+    def sleep(seconds):
+        calls.append(seconds)
+        if len(calls) == 2:
+            target.mkdir()
+
+    sync_checkpoints_hf.wait_for_dir(target, interval=7.0, sleep=sleep)
+    assert calls == [7.0, 7.0]
+
+
+def test_one_shot_sync_still_refuses_a_missing_directory(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["sync_checkpoints_hf.py", "--ckpt_dir", str(tmp_path / "absent")])
+    assert sync_checkpoints_hf.main() == 1
+    assert "Not a directory" in capsys.readouterr().err
+
+
+def test_watch_mode_waits_for_the_directory_instead_of_exiting(tmp_path, monkeypatch, capsys):
+    """The bootstrap starts the watcher before training and Lightning creates
+    <run>/checkpoints at the first save. On the first cloud run both watchers
+    printed 'Not a directory' and exited within a second; nothing was synced."""
+
+    class Reached(Exception):
+        pass
+
+    def fake_wait(path):
+        assert path == (tmp_path / "absent").resolve()
+        raise Reached
+
+    monkeypatch.setattr(sync_checkpoints_hf, "wait_for_dir", fake_wait)
+    monkeypatch.setattr(
+        sys, "argv", ["sync_checkpoints_hf.py", "--ckpt_dir", str(tmp_path / "absent"), "--watch"]
+    )
+    with pytest.raises(Reached):
+        sync_checkpoints_hf.main()
+    assert "Waiting for" in capsys.readouterr().err
