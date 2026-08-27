@@ -370,3 +370,44 @@ def test_seed_and_shuffle_survive_as_attributes():
     loader = _loader(seed=11, shuffle=True)
     assert loader.seed == 11
     assert loader.shuffle is True
+
+
+class _ShrinkingDS(_RestartDS):
+    """A one-pass bag: epoch 0 has N items, epoch 1 has 3, epoch 2 none."""
+
+    def set_epoch(self, epoch: int) -> None:
+        # DpfTrainDataset.set_epoch is monotonic; the datamodule relies on it.
+        if int(epoch) >= self._epoch:
+            self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return {0: N, 1: 3}.get(self._epoch, 0)
+
+    def __getitem__(self, idx):
+        return idx
+
+
+def test_reloaded_train_loader_is_measured_on_the_current_epochs_bag():
+    """Lightning reads len(loader) when it rebuilds the loader at an epoch
+    boundary and only then runs on_train_epoch_start, where the bag used to
+    switch. On the PDB-cluster run the cached count stayed at epoch 0's 7,864
+    while epoch 1 held 539: wrong progress bar, wrong ETA, and every later
+    epoch logged as 'stopped early' with no epoch-end checkpoint."""
+
+    class _Trainer:
+        current_epoch = 1
+
+    dm = ConfRoverDataModule(train_dataset=_ShrinkingDS())
+    dm.trainer = _Trainer()
+    loader = dm.train_dataloader()
+    assert dm.train_dataset._epoch == 1
+    assert len(loader) == -(-3 // BATCH)
+
+    # monotonic: a stale/lower trainer epoch never rewinds the bag
+    _Trainer.current_epoch = 0
+    dm.train_dataloader()
+    assert dm.train_dataset._epoch == 1
+
+    # no trainer attached (plain consumers): unchanged behaviour
+    dm2 = ConfRoverDataModule(train_dataset=_ShrinkingDS())
+    assert len(dm2.train_dataloader()) == -(-N // BATCH)

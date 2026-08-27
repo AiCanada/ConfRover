@@ -2655,6 +2655,18 @@ def _train_epoch_completed(trainer) -> bool:
     plain Lightning behaviour rather than silently skipping a save.
     """
     total = getattr(trainer, "num_training_batches", None)
+    # Lightning caches num_training_batches when it (re)builds the loader; the
+    # loader's own len() follows the bag, which --one_pass_frames shrinks each
+    # epoch. On the PDB-cluster run the cache said 7,864 while epoch 1 held 539
+    # batches, so a fully consumed epoch read as "stopped early" and no
+    # epoch-end checkpoint was written. Ask the loader when it can answer.
+    loader = getattr(trainer, "train_dataloader", None)
+    try:
+        live = len(loader) if loader is not None else None
+    except TypeError:
+        live = None
+    if live:
+        total = live
     if total is None or total in (0, float("inf")):
         return True
     try:

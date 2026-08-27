@@ -149,6 +149,19 @@ class ConfRoverDataModule(LightningDataModule):
         cfg = dict(self.train_dataset.loader_cfg.to_dict())
         if cfg.get("num_workers") and not cfg.get("worker_init_fn"):
             cfg["worker_init_fn"] = dataloader_worker_init
+        # Lightning measures len(loader) right here, when it rebuilds the loader
+        # at an epoch boundary (reload_dataloaders_every_n_epochs=1), and only
+        # afterwards runs on_train_epoch_start, which is where the bag used to
+        # switch epochs. With --one_pass_frames the bag shrinks between epochs
+        # (7,864 -> 539 -> 6 on the PDB-cluster run), so the cached count was
+        # the previous epoch's: the progress bar and ETA were wrong, and every
+        # later epoch read as "stopped early" and lost its epoch-end checkpoint.
+        # set_epoch is monotonic, so this is a no-op within an epoch and on a
+        # resume that restores a later epoch below.
+        trainer = getattr(self, "trainer", None)
+        current_epoch = getattr(trainer, "current_epoch", None) if trainer is not None else None
+        if current_epoch is not None and hasattr(self.train_dataset, "set_epoch"):
+            self.train_dataset.set_epoch(int(current_epoch))
         train_loader = ResumableDataLoader(
             dataset=self.train_dataset,
             collate_fn=self.train_dataset.collate,

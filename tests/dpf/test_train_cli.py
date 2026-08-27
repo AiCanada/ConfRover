@@ -1477,6 +1477,20 @@ def test_a_short_epoch_is_not_recorded_as_an_epoch_boundary(tmp_path, monkeypatc
     assert saves == [3]
 
 
+def test_a_consumed_one_pass_epoch_counts_as_completed_despite_a_stale_cache():
+    """Lightning caches num_training_batches when it rebuilds the loader at the
+    epoch boundary, before the bag switches epochs. With --one_pass_frames the
+    PDB-cluster run's epoch 1 held 539 batches while the cache still said 7,864:
+    a fully consumed epoch was logged 'stopped early' and its epoch-end
+    checkpoint skipped. The loader's own len() follows the bag."""
+    trainer = _epoch_trainer(ready=539, total=7864, epoch=1)
+    trainer.train_dataloader = [None] * 539
+    assert train_cli._train_epoch_completed(trainer) is True
+    trainer.train_dataloader = [None] * 539
+    trainer.fit_loop.epoch_loop.batch_progress.current.ready = 200
+    assert train_cli._train_epoch_completed(trainer) is False, "a real early stop still is one"
+
+
 def test_an_unknowable_epoch_length_keeps_the_plain_behaviour():
     """Streaming data has no batch count; never silently skip the save."""
     assert train_cli._train_epoch_completed(_epoch_trainer(0, None)) is True
