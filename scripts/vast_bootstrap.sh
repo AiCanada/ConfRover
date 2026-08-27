@@ -84,7 +84,7 @@ say "2/6  download payload from $HF_REPO"
 # going, a bare download on a *replacement* instance would drag all of them down on top
 # of the payload. The run needs run/checkpoints/ (the file it resumes from), not
 # checkpoints/ (the archive it writes to).
-hf download "$HF_REPO" --repo-type dataset --local-dir "$DATA" --exclude "checkpoints/*"
+hf download "$HF_REPO" --repo-type dataset --local-dir "$DATA" --max-workers "${HF_WORKERS:-32}" --exclude "checkpoints/*"
 
 # The run directory is what --resume auto and the default --split_file look at.
 mkdir -p "$RUN"

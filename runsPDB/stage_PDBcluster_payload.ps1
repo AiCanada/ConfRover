@@ -32,7 +32,8 @@ py -3.13 scripts\stage_remote_payload.py `
   --checkpoint none `
   --weights    "$repo\runsPDB\original_confrover_base_20m_v1_0.pt" `
   --out        "$out" `
-  --remote_root /workspace/confrover_data
+  --remote_root /workspace/confrover_data `
+  --bundle pdbc
 
 if ($LASTEXITCODE -ne 0) { Write-Error "staging failed with exit code $LASTEXITCODE"; exit $LASTEXITCODE }
 Write-Host "staged OK -> $out"

@@ -40,6 +40,7 @@ import os
 import re
 import shutil
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,32 @@ CKPT_SUBDIR = "confrover_ckpts"
 RUN_SUBDIR = "run"
 CATALOG_NAME = "catalog.json"
 MANIFEST_NAME = "MANIFEST.sha256"
+BUNDLES_DIR = "bundles"
+
+
+def write_bundle(out: Path, name: str) -> tuple[Path, int]:
+    """Archive the staged directory ``out/name`` as ``out/bundles/<name>.tar.gz``.
+
+    The hub rate-limits per-file requests (HTTP 429, ~3 min back-off each), so a
+    directory of tens of thousands of small files -- the PDB-cluster structures --
+    takes hours to fetch one by one no matter the bandwidth. The bootstrap fetches
+    the archive instead and excludes the directory from the per-file download; the
+    manifest still lists every member, so verification is unchanged. The archive
+    itself is deliberately not in the manifest: it is a transport, not payload.
+    """
+    src = out / name
+    if not src.is_dir():
+        raise SystemExit(f"--bundle {name}: {src} is not a staged directory")
+    bundles = out / BUNDLES_DIR
+    bundles.mkdir(exist_ok=True)
+    dst = bundles / f"{name}.tar.gz"
+    count = 0
+    with tarfile.open(dst, "w:gz", compresslevel=1) as tar:
+        for path in sorted(src.rglob("*")):
+            if path.is_file():
+                tar.add(path, arcname=(Path(name) / path.relative_to(src)).as_posix(), recursive=False)
+                count += 1
+    return dst, count
 REPR_INDEX_NAME = "seqres_to_index.csv"
 
 #: Only these are read from an ATLAS family directory. Everything else in
@@ -372,6 +399,15 @@ def main() -> int:
         "fresh run that has nothing to resume.",
     )
     parser.add_argument(
+        "--bundle",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Also pack the staged directory DIR as bundles/DIR.tar.gz so the "
+        "instance can fetch it as one file instead of tens of thousands "
+        "(repeatable; the bootstrap's HF_BUNDLES default is 'pdbc').",
+    )
+    parser.add_argument(
         "--skip_hash",
         action="store_true",
         help="Skip the sha256 manifest (it reads every staged byte).",
@@ -552,6 +588,12 @@ def main() -> int:
                 lines.append(f"{sha256_of(path)}  {rel}")
         (out / MANIFEST_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"  manifest : {MANIFEST_NAME} ({len(lines)} entries)")
+
+    # ---- 7. bundles (transport for the many-small-files directories) --------
+    for name in args.bundle:
+        dst, count = write_bundle(out, name)
+        print(f"  bundle   : {dst.relative_to(out).as_posix()} "
+              f"({dst.stat().st_size / 2**30:.2f} GiB, {count} files)")
 
     print(f"\nPAYLOAD: {total / 2**30:.2f} GiB in {len(staged)} files at {out}")
     print(f"Upload this tree so it lands at {remote_root} on the instance, e.g.")

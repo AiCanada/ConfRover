@@ -450,3 +450,44 @@ def test_the_pdbcluster_bootstrap_pins_the_run_it_launches():
     ):
         assert flag in text, flag
     assert "--resume epoch" not in text, "fresh run: nothing to resume from an epoch boundary"
+
+
+# --- bundles: one archive instead of tens of thousands of hub requests --------
+
+
+def test_bundle_round_trips_the_staged_directory(tmp_path):
+    import tarfile
+
+    out = tmp_path / "payload"
+    for fam, member in (("fam_a", "1abc_A"), ("fam_a", "1abd_B"), ("fam_b", "2xyz_A")):
+        p = out / "pdbc" / fam / f"{member}.pdb"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"ATOM {member}\n")
+    dst, count = stage_remote_payload.write_bundle(out, "pdbc")
+    assert dst == out / "bundles" / "pdbc.tar.gz" and count == 3
+    with tarfile.open(dst) as tar:
+        names = sorted(tar.getnames())
+    # arcnames start with the directory name, so `tar -xzf ... -C $PAYLOAD` lands
+    # them exactly where the per-file download would have.
+    assert names == ["pdbc/fam_a/1abc_A.pdb", "pdbc/fam_a/1abd_B.pdb", "pdbc/fam_b/2xyz_A.pdb"]
+    with tarfile.open(dst) as tar:
+        tar.extractall(tmp_path / "unpacked", filter="data")
+    assert (tmp_path / "unpacked" / "pdbc" / "fam_b" / "2xyz_A.pdb").read_text() == "ATOM 2xyz_A\n"
+
+
+def test_bundle_refuses_a_directory_that_was_not_staged(tmp_path):
+    with pytest.raises(SystemExit, match="not a staged directory"):
+        stage_remote_payload.write_bundle(tmp_path, "pdbc")
+
+
+def test_bootstrap_prefers_bundles_and_excludes_them_from_the_snapshot():
+    text = (REPO_ROOT / "scripts" / "vast_bootstrap_pdbcluster.sh").read_text(encoding="utf-8")
+    assert 'HF_BUNDLES="${HF_BUNDLES:-pdbc}"' in text
+    assert "bundles/$name.tar.gz" in text
+    assert 'tar -xzf "$DL/$rel" -C "$PAYLOAD"' in text
+    # a downloaded bundle removes its directory from the per-file snapshot
+    assert 'EXCLUDES+=(--exclude "${HF_SUBDIR:+$HF_SUBDIR/}$name/*")' in text
+    assert '"${EXCLUDES[@]}"' in text
+    # the staging wrapper actually produces the bundle the bootstrap looks for
+    ps1 = (REPO_ROOT / "runsPDB" / "stage_PDBcluster_payload.ps1").read_text(encoding="utf-8")
+    assert "--bundle pdbc" in ps1

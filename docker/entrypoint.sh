@@ -78,7 +78,7 @@ case "$MODE" in
     export HF_REPO="${HF_REPO:?}"
     DL="${DL:-/workspace/hf_download}"
     DATA="${DATA:-/workspace/confrover_data}"
-    hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --exclude "checkpoints/*"
+    hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --max-workers "${HF_WORKERS:-32}" --exclude "checkpoints/*"
     [[ -e "$DATA" ]] || ln -s "$DL" "$DATA"
     exec python "$REPO/scripts/verify_remote_payload.py" --root "$DATA" "$@"
     ;;

@@ -95,12 +95,31 @@ say "2/6  download payload $HF_REPO/${HF_SUBDIR:-<root>}"
 # Resumable: re-running skips what is already local. checkpoints/* is excluded: that
 # is where this run's own checkpoints are synced to, and a replacement instance
 # must not drag them all back down on top of the payload.
+# The payload is ~49,000 files. The hub rate-limits per-file requests (HTTP 429 with
+# a ~3 min back-off each) long before bandwidth matters, so the directories of many
+# small files are also shipped as bundles/<name>.tar.gz (stage_remote_payload.py
+# --bundle): one archive is minutes where ~44,000 structure files were hours. A bundle
+# the repo does not have is skipped and that directory falls back to the per-file
+# download; either way step 3 checks every extracted file against the manifest.
+HF_WORKERS="${HF_WORKERS:-32}"
+HF_BUNDLES="${HF_BUNDLES:-pdbc}"
+PAYLOAD="$DL${HF_SUBDIR:+/$HF_SUBDIR}"
+mkdir -p "$PAYLOAD"
+EXCLUDES=(--exclude "checkpoints/*")
+for name in $HF_BUNDLES; do
+  rel="${HF_SUBDIR:+$HF_SUBDIR/}bundles/$name.tar.gz"
+  if out="$(hf download "$HF_REPO" "$rel" --repo-type dataset --local-dir "$DL" 2>&1)"; then
+    echo "bundle $name: extracting $rel"
+    tar -xzf "$DL/$rel" -C "$PAYLOAD"
+    EXCLUDES+=(--exclude "${HF_SUBDIR:+$HF_SUBDIR/}$name/*")
+  else
+    echo "bundle $name: not available ($(printf '%s' "$out" | tail -1)); per-file download"
+  fi
+done
 if [[ -n "$HF_SUBDIR" ]]; then
-  hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --include "$HF_SUBDIR/*" --exclude "checkpoints/*"
-  PAYLOAD="$DL/$HF_SUBDIR"
+  hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --max-workers "$HF_WORKERS" --include "$HF_SUBDIR/*" "${EXCLUDES[@]}"
 else
-  hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --exclude "checkpoints/*"
-  PAYLOAD="$DL"
+  hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --max-workers "$HF_WORKERS" "${EXCLUDES[@]}"
 fi
 if [[ ! -e "$DATA" ]]; then
   ln -s "$PAYLOAD" "$DATA"
