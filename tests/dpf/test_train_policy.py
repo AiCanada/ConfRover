@@ -189,6 +189,27 @@ def test_provenance_accepts_this_repos_finetune_and_v11():
         assert assert_checkpoint_provenance(payload) == family
 
 
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "runsPDB/PDBcluster_from_base/confrover_base_PDBcluster.pt",
+        "confrover_base_pdbcluster.ckpt",
+        "confrover-base-dpf.pt",
+        "confrover_base_dpf_v2.pt",
+    ],
+)
+def test_every_finetune_this_repo_writes_is_a_legal_starting_point(ref):
+    """The weights file is confrover_base_<--ckpt_prefix>.pt; the PDB-cluster run
+    writes confrover_base_PDBcluster.pt and must be resumable from, like dpf."""
+    assert is_base_weight_family(ref)
+    assert_base_weight_family(ref)
+
+
+@pytest.mark.parametrize("ref", ["confrover_base_interp.pt", "confrover_base_.pt", "other_base_dpf.pt"])
+def test_the_finetune_stem_does_not_open_the_door_to_foreign_weights(ref):
+    assert not is_base_weight_family(ref)
+
+
 def test_provenance_tolerates_ordinary_module_names():
     """A submodule called 'name: ...' must not be read as a foreign family."""
     payload = {

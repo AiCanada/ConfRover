@@ -92,6 +92,14 @@ _BASE_NAME_RE = re.compile(
 #: This repo's own DPF fine-tune output, which is a legal starting point again.
 _DPF_FINETUNE_STEMS = frozenset({"confrover_base_dpf", "confrover-base-dpf"})
 
+#: Every fine-tune this repo writes is ``confrover_base_<--ckpt_prefix>.pt``
+#: (``confrover_base_dpf.pt``, ``confrover_base_PDBcluster.pt``, ...): base-20M
+#: weights trained further here, so a legal starting point again. The negative
+#: lookahead keeps model-size tokens (20m, 40m, ...) out of the prefix slot: the
+#: published base names stay on the stricter matcher below, foreign sizes are
+#: refused.
+_OWN_FINETUNE_RE = re.compile(r"^confrover[-_]base[-_](?!\d+m(?:[-_]|$))[a-z0-9][a-z0-9_-]*$")
+
 #: Kept for backwards compatibility; the live matcher is :func:`is_base_weight_family`.
 ALLOWED_BASE_FILENAMES = frozenset(
     {
@@ -142,7 +150,7 @@ def is_base_weight_family(model_ref: str | Path) -> bool:
         return False
     if name == UNVERIFIED_WEIGHT_FAMILY.lower():
         return True
-    if name in _DPF_FINETUNE_STEMS:
+    if name in _DPF_FINETUNE_STEMS or _OWN_FINETUNE_RE.match(name):
         return True
     # search(), not match(): a descriptive prefix ("original_", "copy_of_") on a
     # local copy of the real base weights must not condemn it. The "interp" veto
@@ -178,7 +186,8 @@ def assert_base_weight_family(model_ref: str | Path) -> None:
     raise TrainPolicyError(
         "DPF additional training must start from "
         f"{BASE_MODEL_NAME} (a ConfRover-base-20M[-v1.x] file, with or without a "
-        f".pt/.ckpt suffix) or this repo's confrover_base_dpf.pt. "
+        f".pt/.ckpt suffix) or a fine-tune this repo wrote "
+        f"(confrover_base_<ckpt_prefix>.pt, e.g. confrover_base_dpf.pt). "
         f"Refusing model ref {model_ref!r}."
     )
 

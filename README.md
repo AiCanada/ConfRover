@@ -399,7 +399,7 @@ The same command is the resume command (`--resume auto` is the default): if `<ou
 
 To stop or pause a long run without losing the current epoch, drop an empty `STOP` or `PAUSE` file in `<output>` (or press Ctrl+C). The current step finishes, then a checkpoint is written that includes the bag epoch and loader cursor. Rerun the same command to continue. Do not `Stop-Process -Force` on Windows — that cannot be caught and skips the save.
 
-Writes `confrover_base_dpf.pt` (ConfRover `from_pretrained` schema) plus Lightning checkpoints. The published base file is not overwritten.
+Writes `confrover_base_<ckpt_prefix>.pt` (`confrover_base_dpf.pt` by default, `confrover_base_PDBcluster.pt` with `--ckpt_prefix PDBcluster`; ConfRover `from_pretrained` schema) plus Lightning checkpoints. The published base file is not overwritten.
 
 `--family_allowlist` can restrict to a chain list such as `scripts/newpdbidlistrain.py` output (novel ATLAS PDB IDs, L ≤ 384).
 

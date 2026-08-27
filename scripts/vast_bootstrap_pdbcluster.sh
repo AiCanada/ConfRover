@@ -185,12 +185,18 @@ say "5/6  checkpoint sync watcher"
 # Storage is billed per GB-month for as long as the instance exists. Uploads each new
 # checkpoint to $HF_REPO/checkpoints/$RUN_NAME, reads the size back, then frees the
 # local copy -- never last.ckpt, never the newest two, never anything unconfirmed.
-nohup python "$REPO/scripts/sync_checkpoints_hf.py" \
-    --ckpt_dir "$RUN/checkpoints" \
-    --repo_id "$HF_REPO" --repo_type dataset --prefix "checkpoints/$RUN_NAME" \
-    --watch --interval 900 --prune \
-    > "$RUN/sync_hf.log" 2>&1 &
-echo "sync watcher pid $! -> $RUN/sync_hf.log"
+# One watcher per run directory: the smoke pass starts it too, and a second one
+# on the same --prune target would race the first over which copies to free.
+if pgrep -f "sync_checkpoints_hf.py --ckpt_dir $RUN/checkpoints" > /dev/null; then
+  echo "sync watcher already running (pid $(pgrep -f "sync_checkpoints_hf.py --ckpt_dir $RUN/checkpoints" | head -1)) -> $RUN/sync_hf.log"
+else
+  nohup python "$REPO/scripts/sync_checkpoints_hf.py" \
+      --ckpt_dir "$RUN/checkpoints" \
+      --repo_id "$HF_REPO" --repo_type dataset --prefix "checkpoints/$RUN_NAME" \
+      --watch --interval 900 --prune \
+      >> "$RUN/sync_hf.log" 2>&1 &
+  echo "sync watcher pid $! -> $RUN/sync_hf.log"
+fi
 
 if [[ $TRAIN -eq 0 ]]; then
   say "stopping before training"

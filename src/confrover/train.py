@@ -1676,7 +1676,9 @@ def run_train(args: argparse.Namespace) -> None:
         if getattr(trainer, "world_size", 1) > 1:
             trainer.strategy.barrier()
         return
-    ckpt_path = output_dir / "confrover_base_dpf.pt"
+    # confrover_base_dpf.pt for the ATLAS DPF fine-tune, confrover_base_PDBcluster.pt
+    # for the PDB-cluster one: the same --ckpt_prefix that names the checkpoints.
+    ckpt_path = output_dir / f"confrover_base_{_ckpt_prefix(args)}.pt"
     if trainer.is_global_zero:
         model_cfg = getattr(model, "export_model_cfg", None)
         if model_cfg is None:
