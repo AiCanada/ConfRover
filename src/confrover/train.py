@@ -1621,6 +1621,14 @@ def run_train(args: argparse.Namespace) -> None:
         _build_model_checkpoint(output_dir, args),
         _build_epoch_boundary_checkpoint(output_dir, ckpt_prefix),
     ]
+    if float(getattr(args, "ema_decay", 0.0) or 0.0) > 0:
+        # Before the checkpoint callbacks in hook order? Lightning runs
+        # on_validation_start/end for every callback in list order, and the
+        # checkpoint callbacks act in on_validation_end -- with the EMA
+        # callback earlier in the list its swap-out runs first, so the
+        # best-forward file holds the raw weights and the EMA state, which
+        # is what a resume needs; the *_ema.pt export carries the average.
+        callbacks.insert(2, EmaWeights(float(args.ema_decay)))
     if val_dataset is not None:
         callbacks.append(_build_best_val_checkpoint(output_dir, ckpt_prefix))
     trainer_kwargs: dict[str, Any] = _val_trainer_kwargs(val_dataset, args)
@@ -1744,10 +1752,36 @@ def run_train(args: argparse.Namespace) -> None:
         log.info(
             f"Saved fine-tune weights to {ckpt_path} (weight_family={weight_family})"
         )
+        ema = _ema_callback(trainer)
+        ema_path = None
+        if ema is not None and ema.num_updates > 0:
+            ema_path = output_dir / f"confrover_base_{_ckpt_prefix(args)}_ema.pt"
+            ema.swap_in(model)
+            try:
+                torch.save(
+                    {
+                        "state_dict": model.state_dict(),
+                        "model_cfg": model_cfg,
+                        "weight_family": weight_family,
+                        "base_model_ref": str(args.model),
+                        "tasks": tasks,
+                        "split_file": str(split_path),
+                        "run_manifest": str(manifest_path),
+                        "ema": {"decay": ema.decay, "num_updates": ema.num_updates},
+                    },
+                    ema_path,
+                )
+            finally:
+                ema.swap_out(model)
+            log.info(
+                f"Saved EMA weights to {ema_path} (decay={ema.decay:g}, "
+                f"{ema.num_updates} updates)"
+            )
         set_run_manifest_status(
             manifest_path,
             MANIFEST_STATUS_COMPLETED,
             finetuned_checkpoint=str(ckpt_path),
+            **({"ema_checkpoint": str(ema_path)} if ema_path else {}),
         )
     if getattr(trainer, "world_size", 1) > 1:
         trainer.strategy.barrier()
@@ -2085,6 +2119,17 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=1.0,
         help="Trainer(gradient_clip_val=). The diffusion score loss scales with "
         "the sampled timestep and can swing by orders of magnitude; <=0 disables.",
+    )
+    fit.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.0,
+        help="Keep an exponential moving average of the weights (decay per "
+        "optimizer step, e.g. 0.999; <=0 disables). Validation, the best-forward "
+        "selection and the *_ema.pt export use the averaged weights; training "
+        "and the periodic checkpoints keep the raw ones. Standard practice for "
+        "diffusion models: the raw weights of a small-batch run jitter around "
+        "the optimum, the average sits in it.",
     )
     fit.add_argument(
         "--ckpt_every_n_steps",
@@ -2672,6 +2717,116 @@ class ImprovementCheckpoint(TimedModelCheckpoint):
         if self.mode == "min":
             return bool(current < best)
         return bool(current > best)
+
+
+class EmaWeights(Callback):
+    """Exponential moving average of the trainable weights (``--ema_decay``).
+
+    Updated after every optimizer step (not every batch: with gradient
+    accumulation ``global_step`` only advances on the real step), warmed up as
+    ``min(decay, (1 + n) / (10 + n))`` so the first averages are not pinned to
+    the starting weights, swapped in for validation (so ``val/loss_forward``
+    and the best-forward selection judge the averaged model) and swapped back
+    out for training. State rides in the checkpoint through the callback
+    state, so a resume continues the same average.
+    """
+
+    def __init__(self, decay: float):
+        if not 0.0 < float(decay) < 1.0:
+            raise ValueError(f"--ema_decay must be in (0, 1), got {decay}")
+        self.decay = float(decay)
+        self.shadow: list[torch.Tensor] | None = None
+        self.num_updates = 0
+        self._last_step = -1
+        self._backup: list[torch.Tensor] | None = None
+
+    # -- helpers ------------------------------------------------------------
+    @staticmethod
+    def _params(pl_module) -> list[torch.Tensor]:
+        return [p for p in pl_module.parameters() if p.requires_grad]
+
+    def _ensure(self, pl_module) -> None:
+        params = self._params(pl_module)
+        if self.shadow is None:
+            self.shadow = [p.detach().clone() for p in params]
+        elif len(self.shadow) != len(params):
+            raise RuntimeError(
+                f"EMA state has {len(self.shadow)} tensors, model has {len(params)}"
+            )
+        else:
+            self.shadow = [s.to(p.device) for s, p in zip(self.shadow, params)]
+
+    def effective_decay(self) -> float:
+        n = self.num_updates
+        return min(self.decay, (1.0 + n) / (10.0 + n))
+
+    @torch.no_grad()
+    def update(self, pl_module) -> None:
+        self._ensure(pl_module)
+        params = self._params(pl_module)
+        d = self.effective_decay()
+        # shadow = d * shadow + (1 - d) * param  ==  lerp(shadow, param, 1 - d)
+        torch._foreach_lerp_(self.shadow, [p.detach() for p in params], 1.0 - d)
+        self.num_updates += 1
+
+    @torch.no_grad()
+    def swap_in(self, pl_module) -> None:
+        """Put the averaged weights into the model, remembering the raw ones."""
+        self._ensure(pl_module)
+        params = self._params(pl_module)
+        self._backup = [p.detach().clone() for p in params]
+        for p, s in zip(params, self.shadow):
+            p.copy_(s)
+
+    @torch.no_grad()
+    def swap_out(self, pl_module) -> None:
+        if self._backup is None:
+            return
+        for p, b in zip(self._params(pl_module), self._backup):
+            p.copy_(b)
+        self._backup = None
+
+    # -- Lightning hooks ----------------------------------------------------
+    def on_fit_start(self, trainer, pl_module) -> None:  # noqa: D102
+        self._ensure(pl_module)
+        self._last_step = int(getattr(trainer, "global_step", 0))
+        log.info(
+            f"EMA of weights on: decay={self.decay:g} ({len(self.shadow)} tensors, "
+            f"{self.num_updates} updates so far)"
+        )
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:  # noqa: D102
+        step = int(getattr(trainer, "global_step", 0))
+        if step != self._last_step:
+            self._last_step = step
+            self.update(pl_module)
+
+    def on_validation_start(self, trainer, pl_module) -> None:  # noqa: D102
+        if self.num_updates > 0:
+            self.swap_in(pl_module)
+
+    def on_validation_end(self, trainer, pl_module) -> None:  # noqa: D102
+        self.swap_out(pl_module)
+
+    def state_dict(self) -> dict[str, Any]:  # noqa: D102
+        return {
+            "decay": self.decay,
+            "num_updates": int(self.num_updates),
+            "shadow": [s.detach().cpu() for s in self.shadow] if self.shadow else None,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:  # noqa: D102
+        self.decay = float(state_dict.get("decay", self.decay))
+        self.num_updates = int(state_dict.get("num_updates", 0))
+        shadow = state_dict.get("shadow")
+        self.shadow = [torch.as_tensor(s) for s in shadow] if shadow else None
+
+
+def _ema_callback(trainer) -> "EmaWeights | None":
+    for cb in getattr(trainer, "callbacks", []) or []:
+        if isinstance(cb, EmaWeights):
+            return cb
+    return None
 
 
 def _build_model_checkpoint(

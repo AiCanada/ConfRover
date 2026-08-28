@@ -52,6 +52,16 @@ WINDOW="${WINDOW:-9}"
 ONE_PASS="${ONE_PASS:-true}"
 IID_STRIDE="${IID_STRIDE:-4}"
 MAX_EPOCHS="${MAX_EPOCHS:-90}"
+# Optimisation recipe. The defaults are the v888 recipe; dpf_from_base_v2 runs
+# LR=3e-5 WARMUP=500 ACCUM=4 EMA_DECAY=0.999 (see the run notes in the PR).
+CKPT_PREFIX="${CKPT_PREFIX:-dpf}"
+LR="${LR:-1e-4}"
+WARMUP="${WARMUP:-50}"
+MIN_RATIO="${MIN_RATIO:-0.1}"
+ACCUM="${ACCUM:-1}"
+EMA_DECAY="${EMA_DECAY:-0}"
+VAL_EVERY="${VAL_EVERY:-500}"
+CKPT_EVERY="${CKPT_EVERY:-500}"
 HF_SYNC="${HF_SYNC:-0}"
 HF_SYNC_REPO="${HF_SYNC_REPO:-AICanada/ConfRover-PDBcluster}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -75,6 +85,7 @@ if [[ "$TF32" == "1" ]]; then
   echo "TF32 ON (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1)"
 fi
 echo "run=$RUN_NAME  window=$WINDOW  one_pass=$ONE_PASS  iid_stride=$IID_STRIDE  max_epochs=$MAX_EPOCHS  workers=$WORKERS  hf_sync=$HF_SYNC  tf32=$TF32"
+echo "recipe: ckpt_prefix=$CKPT_PREFIX lr=$LR warmup=$WARMUP min_ratio=$MIN_RATIO accum=$ACCUM ema_decay=$EMA_DECAY val_every=$VAL_EVERY ckpt_every=$CKPT_EVERY"
 echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
 : "${HF_TOKEN:?export HF_TOKEN (read on $HF_REPO and $WEIGHTS_REPO)}"
 pip install -q "huggingface_hub>=0.23"
@@ -141,7 +152,7 @@ DATA_FLAGS=(
   --cache_dir "$DATA"
   --folding_repr "$DATA/folding_repr"
   --model "$WEIGHTS"
-  --ckpt_prefix dpf
+  --ckpt_prefix "$CKPT_PREFIX"
   --window_frames "$WINDOW"
   --one_pass_frames "$ONE_PASS"
   --tasks iid,forward
@@ -200,10 +211,11 @@ say "6/6  train"
 # stopped run. Every knob that shapes the sampling bag is in DATA_FLAGS above.
 confrover train "${DATA_FLAGS[@]}" \
   --output "$RUN" \
-  --lr 1e-4 --lr_schedule cosine --lr_warmup_steps 50 --lr_min_ratio 0.1 \
+  --lr "$LR" --lr_schedule cosine --lr_warmup_steps "$WARMUP" --lr_min_ratio "$MIN_RATIO" \
   --weight_decay 0.0 --tmin 0.01 --tmax 1.0 \
   --max_epochs "$MAX_EPOCHS" \
-  --accumulate_grad_batches 1 --grad_clip 1.0 \
+  --accumulate_grad_batches "$ACCUM" --grad_clip 1.0 \
+  --ema_decay "$EMA_DECAY" \
   --rescale_attention 8 \
-  --ckpt_every_n_steps 500 --val_every_n_steps 500 --log_every_n_steps 10 \
+  --ckpt_every_n_steps "$CKPT_EVERY" --val_every_n_steps "$VAL_EVERY" --log_every_n_steps 10 \
   --resume auto

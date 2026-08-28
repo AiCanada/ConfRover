@@ -2343,3 +2343,78 @@ def test_best_forward_checkpoint_saves_only_on_improvement(tmp_path):
     assert cb.check_monitor_top_k(None, torch.tensor(0.446)) is False  # equal: not an improvement
     assert cb.check_monitor_top_k(None, torch.tensor(0.439)) is True  # better
     assert cb.check_monitor_top_k(None, None) is False
+
+
+# --- EMA of weights ----------------------------------------------------------
+
+
+class _Two(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+        self.b = torch.nn.Parameter(torch.tensor([10.0]))
+        self.frozen = torch.nn.Parameter(torch.tensor([5.0]), requires_grad=False)
+
+
+class _Tr:
+    def __init__(self, step=0):
+        self.global_step = step
+        self.callbacks = []
+
+
+def test_ema_updates_only_when_the_optimizer_stepped_and_warms_up():
+    m = _Two()
+    ema = train_cli.EmaWeights(0.999)
+    tr = _Tr(step=0)
+    ema.on_fit_start(tr, m)
+    assert [t.tolist() for t in ema.shadow] == [[1.0, 2.0], [10.0]], "frozen params are not averaged"
+    ema.on_train_batch_end(tr, m, None, None, 0)  # accumulation: no optimizer step yet
+    assert ema.num_updates == 0
+    with torch.no_grad():
+        m.a.fill_(3.0)
+    tr.global_step = 1
+    ema.on_train_batch_end(tr, m, None, None, 1)
+    assert ema.num_updates == 1
+    # warm-up: first update uses decay min(0.999, 1/10) = 0.1 -> 0.1*old + 0.9*new
+    assert torch.allclose(ema.shadow[0], torch.tensor([0.1 * 1.0 + 0.9 * 3.0, 0.1 * 2.0 + 0.9 * 3.0]))
+
+
+def test_ema_swaps_in_for_validation_and_restores_the_raw_weights():
+    m = _Two()
+    ema = train_cli.EmaWeights(0.5)
+    tr = _Tr()
+    ema.on_fit_start(tr, m)
+    with torch.no_grad():
+        m.a.fill_(0.0)
+    tr.global_step = 1
+    ema.on_train_batch_end(tr, m, None, None, 0)  # decay 0.1: shadow_a = [0.1, 0.2]
+    raw = m.a.detach().clone()
+    ema.on_validation_start(tr, m)
+    assert torch.allclose(m.a, torch.tensor([0.1, 0.2]))
+    ema.on_validation_end(tr, m)
+    assert torch.equal(m.a, raw)
+
+
+def test_ema_state_round_trips_through_the_checkpoint_and_resumes():
+    m = _Two()
+    ema = train_cli.EmaWeights(0.9)
+    tr = _Tr()
+    ema.on_fit_start(tr, m)
+    for step in (1, 2, 3):
+        with torch.no_grad():
+            m.a.add_(1.0)
+        tr.global_step = step
+        ema.on_train_batch_end(tr, m, None, None, step)
+    state = ema.state_dict()
+    resumed = train_cli.EmaWeights(0.9)
+    resumed.load_state_dict(state)
+    resumed.on_fit_start(_Tr(step=3), m)
+    assert resumed.num_updates == 3
+    assert all(torch.equal(x, y) for x, y in zip(resumed.shadow, ema.shadow))
+
+
+def test_ema_decay_must_be_a_fraction():
+    with pytest.raises(ValueError):
+        train_cli.EmaWeights(1.0)
+    with pytest.raises(ValueError):
+        train_cli.EmaWeights(0.0)

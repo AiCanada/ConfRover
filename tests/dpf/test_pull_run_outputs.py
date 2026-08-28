@@ -175,7 +175,12 @@ def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_window
     assert is_base_weight_family("confrover_base_PDBcluster_step8364.pt")
     assert 'WINDOW="${WINDOW:-9}"' in text and 'ONE_PASS="${ONE_PASS:-true}"' in text
     assert 'IID_STRIDE="${IID_STRIDE:-4}"' in text and 'MAX_EPOCHS="${MAX_EPOCHS:-90}"' in text
-    assert "--ckpt_prefix dpf" in text
+    assert '--ckpt_prefix "$CKPT_PREFIX"' in text and 'CKPT_PREFIX="${CKPT_PREFIX:-dpf}"' in text
+    # the optimisation recipe is env-driven so dpf_from_base_v2 (lr 3e-5, warm-up
+    # 500, accumulate 4, EMA 0.999) and the v888 defaults share one script
+    for knob in ('--lr "$LR"', '--lr_warmup_steps "$WARMUP"', '--accumulate_grad_batches "$ACCUM"',
+                 '--ema_decay "$EMA_DECAY"', '--val_every_n_steps "$VAL_EVERY"'):
+        assert knob in text, knob
     # v888's seed checkpoint (run/checkpoints/*) is in the payload manifest, so it
     # is downloaded for the verify step -- but never copied into $RUN, where
     # --resume auto would otherwise continue v888 instead of starting from $WEIGHTS.
