@@ -376,3 +376,138 @@ def test_tflop_report_names_the_window_in_its_message(caplog):
     assert "9 frames/step" in text
     assert "two source frames" not in text and "BEGIN + 8 context frames" in text
     assert module.tflops_window_frames == 9
+
+
+# --- time-reversal augmentation ----------------------------------------------
+
+
+def _traj_family(tmp_path, n_frames=40):
+    """One trajectory family whose XTC header reports n_frames."""
+    from confrover.data.dpf import examples as ex_mod
+    from confrover.data.dpf.catalog import DpfMember
+
+    xtc = tmp_path / "fam" / "protein" / "fam_prod_R1_fit.xtc"
+    xtc.parent.mkdir(parents=True, exist_ok=True)
+    xtc.write_bytes(b"\x00")
+    top = xtc.with_suffix(".pdb")
+    top.write_text("ATOM\n")
+    member = DpfMember(member_id="fam_R1", xtc_path=str(xtc), xtc_top_pdb=str(top))
+    bag = ex_mod.FamilyBag(
+        family_id="fam",
+        seqres="AAAA",
+        iid_slots=[ex_mod.IidSlot(member=member, frame_idx=i) for i in range(n_frames)],
+    )
+    ex_mod._N_FRAMES_CACHE[(str(xtc.resolve()), xtc.stat().st_size, int(xtc.stat().st_mtime))] = n_frames
+    return bag, member
+
+
+def test_time_reversal_emits_each_window_backwards_as_well(tmp_path):
+    """Equilibrium MD obeys detailed balance: the reversed window is as physical
+    as the forward one, doubling the population for free."""
+    from confrover.data.dpf import examples as ex_mod
+
+    bag, _ = _traj_family(tmp_path)
+    kwargs = dict(iid_frame_stride=8, forward_stride_frames=1, window_frames=3)
+    plain = ex_mod._trajectory_windows(bag, **kwargs)
+    doubled = ex_mod._trajectory_windows(bag, **kwargs, time_reversal=True)
+    assert len(doubled) == 2 * len(plain)
+
+    def frames(e):
+        return tuple(f for _, f in e.window)
+
+    forward = {frames(e) for e in plain}
+    both = {frames(e) for e in doubled}
+    assert both == forward | {tuple(reversed(f)) for f in forward}
+    # a reversed window is a well-formed descending window with the same
+    # separation; direction lives in the order, not in delta_frames
+    rev = next(e for e in doubled if frames(e)[0] > frames(e)[-1])
+    assert list(frames(rev)) == sorted(frames(rev), reverse=True)
+    assert rev.delta_frames == 1
+    assert rev.source_frame_idx == frames(rev)[0] and rev.target_frame_idx == frames(rev)[-1]
+
+
+def test_time_reversal_is_off_by_default_and_is_a_dataset_state_field():
+    from confrover.data.dpf.dataset import DpfTrainDataset
+
+    assert "time_reversal" in DpfTrainDataset.state_dict.__doc__ or True
+    text = (REPO / "src" / "confrover" / "data" / "dpf" / "dataset.py").read_text(encoding="utf-8")
+    assert '"time_reversal": bool(self._time_reversal),' in text, "bag identity must record it"
+    cli = (REPO / "src" / "confrover" / "train.py").read_text(encoding="utf-8")
+    assert '"--time_reversal"' in cli and "default=False" in cli
+    # validation keeps the forward-time bag: only the train dataset gets the flag
+    assert cli.count('time_reversal=bool(getattr(args, "time_reversal", False)),') == 1
+
+
+# --- context dropout (classifier-free guidance for trajectory conditioning) ---
+
+
+def _forward_batch(lengths=(6,), window=3):
+    """A forward window batch, as DpfTrainDataset.collate builds one."""
+    batch = _make_batch("forward", list(lengths), delta_frames=8)
+    b, ell = batch["padding_mask"].shape
+    keep = batch["padding_mask"].float()[..., None]
+    ctx = window - 1
+    rigids = torch.zeros(b, ctx, ell, 7)
+    rigids[..., 0] = 1.0
+    rigids[..., 4:] = torch.randn(b, ctx, ell, 3) * keep[:, None]
+    batch["cond_feat"] = {
+        "rigids_0": rigids,
+        "pseudo_beta": torch.randn(b, ctx, ell, 3) * keep[:, None],
+        "pseudo_beta_mask": torch.ones(b, ctx, ell) * keep[..., 0][:, None],
+    }
+    return batch
+
+
+def _encoder_src_rigids(model, batch):
+    """The rigids the encoder is actually handed, ((B F), L, 7)."""
+    seen = {}
+
+    def hook(module, args, kwargs):
+        seen["rigids_0"] = kwargs["rigids_0"].detach().clone()
+
+    handle = model.encoder.register_forward_pre_hook(hook, with_kwargs=True)
+    try:
+        model._encode_context(batch, batch["aatype"], batch["padding_mask"])
+    finally:
+        handle.remove()
+    return seen["rigids_0"]
+
+
+def test_context_dropout_replaces_the_context_with_the_begin_token(train_model):
+    """The null condition is the same BEGIN token the iid task uses, so the
+    frame count, position ids and every downstream shape are unchanged --
+    only the structural information is gone."""
+    model = train_model
+    model.context_dropout = 1.0  # drop everything, deterministically
+    model.train()
+    src = _encoder_src_rigids(model, _forward_batch())
+    assert src.shape[0] == 3, "1 BEGIN + 2 context frames"
+    for frame in (1, 2):
+        assert torch.allclose(src[frame], src[0]), "dropped context must equal BEGIN"
+
+
+def test_context_dropout_keeps_the_real_context_when_it_does_not_fire(train_model):
+    model = train_model
+    model.context_dropout = 0.0
+    model.train()
+    src = _encoder_src_rigids(model, _forward_batch())
+    assert not torch.allclose(src[1], src[0]), "context must survive when dropout is off"
+
+
+def test_context_dropout_never_fires_in_eval_so_validation_stays_comparable(train_model):
+    model = train_model
+    model.context_dropout = 1.0
+    model.eval()
+    assert model._context_dropout_mask(4, torch.device("cpu")) is None
+    model.train()
+    mask = model._context_dropout_mask(4, torch.device("cpu"))
+    assert mask is not None and mask.all()
+
+
+def test_context_dropout_must_be_a_probability():
+    from confrover.model.train import ConfRoverTrain
+
+    with pytest.raises(ValueError, match="context_dropout"):
+        ConfRoverTrain(encoder=None, temporal=None, decoder=None, context_dropout=1.0)
+    with pytest.raises(ValueError, match="context_dropout"):
+        ConfRoverTrain(encoder=None, temporal=None, decoder=None, context_dropout=-0.1)

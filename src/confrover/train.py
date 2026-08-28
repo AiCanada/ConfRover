@@ -1293,7 +1293,10 @@ class TflopReport(Callback):
         # and, on OOM, step down the length ladder rather than give up: the
         # figure is an estimate quoted "@L<probe>" either way, and the DPF
         # median (L~250) blew a 95 GiB card where the cluster median (L=150) fit.
-        on_cuda = next(pl_module.parameters()).device.type == "cuda"
+        try:
+            on_cuda = next(pl_module.parameters()).device.type == "cuda"
+        except (AttributeError, StopIteration, TypeError):
+            on_cuda = False
         ladder = [int(self.probe_seqlen)] + [
             L for L in (150, 100, 64) if L < int(self.probe_seqlen)
         ]
@@ -1523,6 +1526,7 @@ def run_train(args: argparse.Namespace) -> None:
         samples_per_family=args.samples_per_family,
         static_iid_cap=args.static_iid_cap,
         one_pass_frames=bool(args.one_pass_frames),
+        time_reversal=bool(getattr(args, "time_reversal", False)),
         window_frames=max(1, int(args.window_frames)),
         sample_seed=args.seed,
         batch_size=args.batch_size,
@@ -1606,7 +1610,13 @@ def run_train(args: argparse.Namespace) -> None:
         lr_schedule=args.lr_schedule,
         lr_warmup_steps=args.lr_warmup_steps,
         lr_min_ratio=args.lr_min_ratio,
+        context_dropout=float(getattr(args, "context_dropout", 0.0) or 0.0),
     )
+    if model.context_dropout > 0:
+        log.info(
+            f"Context dropout {model.context_dropout:g}: that fraction of forward "
+            "examples trains the unconditional score (guidance-ready weights)"
+        )
 
     datamodule = ConfRoverDataModule(
         train_dataset=train_dataset, val_dataset=val_dataset
@@ -1874,6 +1884,19 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "consumed per epoch.",
     )
     data.add_argument(
+        "--time_reversal",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="true|false",
+        help="Also draw every forward window backwards. Equilibrium MD obeys "
+        "detailed balance, so a reversed window is a physical trajectory: this "
+        "doubles the forward population and teaches the dynamics rather than "
+        "the arrow of the recordings. Training windows only -- validation keeps "
+        "the forward-time bag so its loss stays comparable across runs.",
+    )
+    data.add_argument(
         "--one_pass_frames",
         type=str2bool,
         nargs="?",
@@ -2030,6 +2053,16 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Cosine floor as a fraction of --lr (0.1 -> 1e-5 when lr is 1e-4).",
+    )
+    model.add_argument(
+        "--context_dropout",
+        type=float,
+        default=0.0,
+        help="Probability that a forward example's context frames are replaced "
+        "by the BEGIN mask token during training, so one set of weights learns "
+        "the conditional and the unconditional score (classifier-free guidance "
+        "for trajectory conditioning). 0.1 is the usual value; 0 disables. "
+        "Validation always sees the real context.",
     )
     model.add_argument("--weight_decay", type=float, default=0.0)
     model.add_argument("--tmin", type=float, default=0.01)

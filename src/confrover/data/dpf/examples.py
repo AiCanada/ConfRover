@@ -243,6 +243,7 @@ def build_examples(
     static_iid_cap: int = DEFAULT_STATIC_IID_CAP,
     one_pass_frames: bool = False,
     window_frames: int = 1,
+    time_reversal: bool = False,
 ) -> list[TrainExample]:
     """Draw examples from each family's conformation bag.
 
@@ -319,6 +320,7 @@ def build_examples(
                     seed=seed,
                     epoch=epoch,
                     one_pass=one_pass_frames,
+                    time_reversal=time_reversal,
                 )
             )
             continue
@@ -394,6 +396,7 @@ def examples_from_split(
     static_iid_cap: int = DEFAULT_STATIC_IID_CAP,
     one_pass_frames: bool = False,
     window_frames: int = 1,
+    time_reversal: bool = False,
 ) -> list[TrainExample]:
     assert_no_leakage(catalog, split)
     task_list = validate_tasks(tasks)
@@ -412,6 +415,7 @@ def examples_from_split(
         static_iid_cap=static_iid_cap,
         one_pass_frames=one_pass_frames,
         window_frames=window_frames,
+        time_reversal=time_reversal,
     )
 
 
@@ -553,6 +557,7 @@ def _trajectory_windows(
     iid_frame_stride: int,
     forward_stride_frames: int | tuple[int, int],
     window_frames: int,
+    time_reversal: bool = False,
 ) -> list[TrainExample]:
     """Every ``window_frames``-frame window of one replica at one ladder stride.
 
@@ -562,6 +567,14 @@ def _trajectory_windows(
     walks the ladder, exactly as the pair candidates do, so the population a
     permutation walk draws from has the same shape as before -- only the
     examples are wider.
+
+    ``time_reversal=True`` also emits each window backwards. Equilibrium MD
+    obeys detailed balance, so a reversed trajectory is as physical as the
+    forward one: it doubles the forward population for free and teaches the
+    temporal trunk the dynamics rather than the arrow of these particular
+    recordings. The reversed window keeps ``delta_frames`` (the separation is a
+    magnitude; the direction lives in the frame order), so position ids, the
+    stride ladder and the permutation walk are unchanged.
     """
     out: list[TrainExample] = []
     ladder = forward_stride_ladder(forward_stride_frames)
@@ -578,19 +591,21 @@ def _trajectory_windows(
                 continue
             for start in range(0, n_frames - span, sample_stride):
                 frames = [start + k * step for k in range(window_frames)]
-                out.append(
-                    TrainExample(
-                        family_id=bag.family_id,
-                        seqres=bag.seqres,
-                        task_mode="forward",
-                        source=member,
-                        target=member,
-                        source_frame_idx=frames[0],
-                        target_frame_idx=frames[-1],
-                        delta_frames=step,
-                        window=tuple((member, f) for f in frames),
+                orders = [frames, frames[::-1]] if time_reversal else [frames]
+                for order in orders:
+                    out.append(
+                        TrainExample(
+                            family_id=bag.family_id,
+                            seqres=bag.seqres,
+                            task_mode="forward",
+                            source=member,
+                            target=member,
+                            source_frame_idx=order[0],
+                            target_frame_idx=order[-1],
+                            delta_frames=step,
+                            window=tuple((member, f) for f in order),
+                        )
                     )
-                )
     return out
 
 
@@ -614,6 +629,7 @@ def _window_examples(
     seed: int,
     epoch: int,
     one_pass: bool,
+    time_reversal: bool = False,
 ) -> list[TrainExample]:
     """The ``--window_frames W`` bag for one family and epoch.
 
@@ -658,7 +674,7 @@ def _window_examples(
             )
     if "forward" in task_list:
         trajectory = _trajectory_windows(
-            bag, iid_frame_stride, forward_stride_frames, W
+            bag, iid_frame_stride, forward_stride_frames, W, time_reversal=time_reversal
         )
         if trajectory:
             out.extend(

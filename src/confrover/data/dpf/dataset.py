@@ -176,6 +176,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         self._samples_per_family = DEFAULT_SAMPLES_PER_FAMILY
         self._static_iid_cap = DEFAULT_STATIC_IID_CAP
         self._one_pass_frames = False
+        self._time_reversal = False
         self._window_frames = 1
         self._sample_seed = 0
         self._epoch = 0
@@ -207,6 +208,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         sample_seed: int = 0,
         static_iid_cap: int = DEFAULT_STATIC_IID_CAP,
         one_pass_frames: bool = False,
+        time_reversal: bool = False,
         window_frames: int = 1,
         **loader_kwargs,
     ) -> "DpfTrainDataset":
@@ -222,6 +224,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             epoch=0,
             static_iid_cap=static_iid_cap,
             one_pass_frames=one_pass_frames,
+            time_reversal=time_reversal,
             window_frames=window_frames,
         )
         subset = catalog.select(split.families(split_name))
@@ -239,6 +242,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         dataset._samples_per_family = int(samples_per_family)
         dataset._static_iid_cap = int(static_iid_cap)
         dataset._one_pass_frames = bool(one_pass_frames)
+        dataset._time_reversal = bool(time_reversal)
         dataset._window_frames = max(1, int(window_frames))
         dataset._sample_seed = int(sample_seed)
         dataset._epoch = 0
@@ -277,6 +281,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             epoch=epoch,
             static_iid_cap=self._static_iid_cap,
             one_pass_frames=self._one_pass_frames,
+            time_reversal=self._time_reversal,
             window_frames=self._window_frames,
         )
         self._epoch = epoch
@@ -300,6 +305,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             # that omitted it would silently rebuild a different epoch.
             "static_iid_cap": int(self._static_iid_cap),
             "one_pass_frames": bool(self._one_pass_frames),
+            "time_reversal": bool(self._time_reversal),
             "forward_stride_frames": self.forward_stride_spec,
             "window_frames": int(self._window_frames),
         }
