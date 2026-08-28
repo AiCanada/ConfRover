@@ -6,9 +6,10 @@
 """Live loss curves for a running (or finished) `confrover train` job.
 
 Reads the run's ``logs/console.log`` -- locally, or straight off the rented box
-over ssh -- and redraws every ``--interval`` seconds: the 10-step train
-heartbeats (total / forward / iid) and the validation points (val / val_forward
-/ val_iid) on one shared step axis.
+over ssh -- and redraws every ``--interval`` seconds as six panels on one page:
+the 10-step train heartbeats (total, forward, iid) across the top and the
+matching validation series beneath, on a shared x axis. One quantity per panel,
+so nothing hides behind anything else and each gets its own y range.
 
     # the cloud run, over ssh, refreshing every minute
     py -3.13 scripts/watch_run_curves.py --host 170.64.254.80 --port 27032 ^
@@ -37,9 +38,10 @@ one without it.
 
 Train heartbeats are noisy by construction: one step is a single protein at a
 single diffusion time, and the mix of iid and forward windows changes step to
-step. The rolling mean (``--smooth``, default 10 points) is the line to read;
-the raw points are drawn faintly behind it. Validation is a fixed bag on a
-deterministic t grid, so those points are comparable step to step as they are.
+step, so the train panels show a rolling mean (``--smooth``; by default it
+scales with each run's length). The raw points are drawn faintly behind it when
+a single run is shown. Validation is a fixed bag on a deterministic t grid, so
+those points are comparable step to step as they are.
 """
 
 from __future__ import annotations
@@ -255,80 +257,81 @@ def write_csv(path: Path, runs: list[dict]) -> None:
                                  "batches": row["step"] * accum, **row})
 
 
-def draw(axes, runs: list[dict], smooth: int | None, x_axis: str, title: str) -> None:
-    """Overlay every run. Colour is the series; runs differ in thickness/marker."""
-    ax_train, ax_val = axes
-    for ax in axes:
+def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
+    """Six panels: train total/forward/iid over the matching validation panels.
+
+    One quantity per panel, so a series is never hidden behind another and each
+    gets its own y range (iid sits well above forward, and the train and val
+    scales differ). Colour still belongs to the series, and runs are told apart
+    by line thickness and marker shape.
+    """
+    for ax in axes.flat:
         ax.clear()
     solo = len(runs) == 1
 
     for index, run in enumerate(runs):
         style = RUN_STYLES[index % len(RUN_STYLES)]
         scale = run["accum"] if x_axis == "batches" else 1
-
-        train = run["train"]
-        steps = [r["step"] * scale for r in train]
-        every = max(1, len(train) // 12)
+        train, vals = run["train"], run["vals"]
         window = smoothing_window(len(train), smooth)
         run["smooth"] = window
-        for train_key, _val_key, name, colour in SERIES:
+        every = max(1, len(train) // 12)
+        steps = [r["step"] * scale for r in train]
+        vsteps = [r["step"] * scale for r in vals]
+
+        for column, (train_key, val_key, name, colour) in enumerate(SERIES):
+            ax_train, ax_val = axes[0][column], axes[1][column]
+
             pts = [(s, r.get(train_key)) for s, r in zip(steps, train)
                    if r.get(train_key) is not None]
-            if not pts:
-                continue
-            xs, ys = zip(*pts)
-            if solo:  # the raw heartbeats only when they are not four deep
-                ax_train.plot(xs, ys, color=colour, alpha=0.18, linewidth=0.8)
-            ax_train.plot(
-                xs, rolling(list(ys), window), color=colour,
-                linewidth=style["linewidth"], marker=style["marker"],
-                markevery=every, markersize=4,
-                label=name if index == 0 else None,
-            )
+            if pts:
+                xs, ys = zip(*pts)
+                if solo:  # the raw heartbeats only when they are not several deep
+                    ax_train.plot(xs, ys, color=colour, alpha=0.18, linewidth=0.8)
+                ax_train.plot(xs, rolling(list(ys), window), color=colour,
+                              linewidth=style["linewidth"], marker=style["marker"],
+                              markevery=every, markersize=4)
 
-        vals = run["vals"]
-        vsteps = [r["step"] * scale for r in vals]
-        for _train_key, val_key, name, colour in SERIES:
             pts = [(s, r.get(val_key)) for s, r in zip(vsteps, vals)
                    if r.get(val_key) is not None]
-            if not pts:
-                continue
-            xs, ys = zip(*pts)
-            ax_val.plot(xs, ys, color=colour, linewidth=style["linewidth"],
-                        marker=style["marker"], markersize=4,
-                        markevery=max(1, len(xs) // 25),
-                        label=f"val {name}" if index == 0 else None)
+            if pts:
+                xs, ys = zip(*pts)
+                ax_val.plot(xs, ys, color=colour, linewidth=style["linewidth"],
+                            marker=style["marker"], markersize=4,
+                            markevery=max(1, len(xs) // 25))
+                if index == 0:
+                    best = min(range(len(ys)), key=lambda i: ys[i])
+                    ax_val.annotate(f"best {ys[best]:.4f}", (xs[best], ys[best]),
+                                    textcoords="offset points", xytext=(5, -11),
+                                    fontsize=7.5, color=colour)
 
-    ax_train.set_ylabel("train loss")
-    ax_train.set_title(title, fontsize=9)
-    ax_train.grid(alpha=0.25)
-    ax_val.set_ylabel("val loss (fixed bag, t grid)")
-    ax_val.set_xlabel("training samples (steps x accumulation)"
-                      if x_axis == "batches" else "optimizer step")
-    ax_val.grid(alpha=0.25)
+    for column, (_train_key, _val_key, name, colour) in enumerate(SERIES):
+        axes[0][column].set_title(f"train {name}", fontsize=10, color=colour)
+        axes[1][column].set_title(f"val {name}", fontsize=10, color=colour)
+        for row in (0, 1):
+            axes[row][column].grid(alpha=0.25)
+        axes[1][column].set_xlabel("training samples (steps x accumulation)"
+                                   if x_axis == "batches" else "optimizer step")
+    axes[0][0].set_ylabel(f"train loss (rolling mean)")
+    axes[1][0].set_ylabel("val loss (fixed bag, t grid)")
 
-    series_legend = ax_train.legend(loc="upper right", fontsize=8, title="series",
-                                    framealpha=0.9)
-    ax_train.add_artist(series_legend)
-    if not solo:
-        from matplotlib.lines import Line2D
+    from matplotlib.lines import Line2D
 
-        handles = []
-        for i, run in enumerate(runs):
-            style = RUN_STYLES[i % len(RUN_STYLES)]
-            best = min((r["val_fwd"] for r in run["vals"] if r.get("val_fwd") is not None),
-                       default=None)
-            label = run["label"]
-            if run["accum"] > 1:
-                label += f" (accum x{run['accum']})"
-            if best is not None:
-                label += f"  best val_fwd {best:.4f}"
-            label += f"  [mean {run.get('smooth', '?')}]"
-            handles.append(Line2D([], [], color="0.35", linewidth=style["linewidth"],
-                                  marker=style["marker"], markersize=4, label=label))
-        ax_train.legend(handles=handles, loc="upper left", fontsize=7.5, title="run",
-                        framealpha=0.9)
-    ax_val.legend(loc="upper right", fontsize=8, framealpha=0.9, ncol=3)
+    handles = []
+    for i, run in enumerate(runs):
+        style = RUN_STYLES[i % len(RUN_STYLES)]
+        best = min((r["val_fwd"] for r in run["vals"] if r.get("val_fwd") is not None),
+                   default=None)
+        label = run["label"]
+        if run["accum"] > 1:
+            label += f" (accum x{run['accum']})"
+        if best is not None:
+            label += f"  best val_fwd {best:.4f}"
+        label += f"  [mean {run.get('smooth', '?')}]"
+        handles.append(Line2D([], [], color="0.35", linewidth=style["linewidth"],
+                              marker=style["marker"], markersize=4, label=label))
+    axes[0][0].legend(handles=handles, loc="upper right", fontsize=7.5,
+                      title="run" if not solo else None, framealpha=0.9)
 
 
 def main() -> int:
@@ -385,7 +388,7 @@ def main() -> int:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 7.5), sharex=True, height_ratios=[2, 1])
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=True, squeeze=False)
     if not args.once:
         try:
             fig.canvas.manager.set_window_title("ConfRover training")
@@ -410,8 +413,9 @@ def main() -> int:
                  + (f"  +{len(runs) - 1} earlier run(s) overlaid" if len(runs) > 1 else "")
                  + "\nloss is comparable only between runs with the same "
                    "--window_frames and task mix")
-        draw(axes, runs, args.smooth, args.x_axis, title)
-        fig.tight_layout()
+        draw(axes, runs, args.smooth, args.x_axis)
+        fig.suptitle(title, fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
         if args.csv:
             write_csv(args.csv, runs)
         if args.out:
