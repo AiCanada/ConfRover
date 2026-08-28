@@ -582,6 +582,7 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
     """
     import threading
     import tkinter as tk
+    from types import SimpleNamespace
 
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -623,6 +624,15 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
         pending geometry has been processed.
         """
         width, height = (int(round(v * fig.dpi)) for v in fig.get_size_inches())
+        # The photo matplotlib blits into is only resized by its <Configure>
+        # handler, which is unbound here (it would rescale the figure as the
+        # canvas scrolled). Without this the raster stayed at the size it had
+        # when the window opened: after a zoom the widget and the scroll region
+        # grew, the drawn image did not, and everything past the old height was
+        # blank -- which is what "the bottom charts are missing" was.
+        # resize() derives inches as pixels/dpi, so passing exactly
+        # inches x dpi leaves the figure's own size untouched.
+        canvas.resize(SimpleNamespace(width=width, height=height))
         widget.configure(width=width, height=height)
         viewport.itemconfigure(window_id, width=width, height=height)
         widget.update_idletasks()

@@ -342,3 +342,46 @@ def test_zoom_scales_the_render_not_the_figure():
         assert int(round(fig.get_size_inches()[0] * fig.dpi)) == 1500
     finally:
         plt.close(fig)
+
+
+def test_the_canvas_photo_must_follow_the_figures_pixel_size():
+    """The raster matplotlib blits into is resized only by its <Configure>
+    handler, which the scrolling window unbinds (it would rescale the figure as
+    the canvas scrolled). Without an explicit resize the photo stayed at its
+    opening size, so after a zoom the widget and scroll region grew while the
+    drawn image did not and everything past the old height was blank."""
+    tk = pytest.importorskip("tkinter")
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("TkAgg")
+    from types import SimpleNamespace
+
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # no display (CI)
+        pytest.skip(f"no Tk display: {exc}")
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    try:
+        root.withdraw()
+        canvas = FigureCanvasTkAgg(fig, master=root)
+        canvas.get_tk_widget().unbind("<Configure>")
+        canvas.draw()
+        assert (canvas._tkphoto.width(), canvas._tkphoto.height()) == (400, 300)
+
+        fig.set_dpi(watch.zoom_dpi(fig.dpi, 1.25))  # 125 dpi -> 500 x 375
+        canvas.draw()
+        assert (canvas._tkphoto.width(), canvas._tkphoto.height()) == (400, 300), (
+            "the photo does not follow a dpi change on its own"
+        )
+
+        width, height = (int(round(v * fig.dpi)) for v in fig.get_size_inches())
+        canvas.resize(SimpleNamespace(width=width, height=height))
+        canvas.draw()
+        assert (canvas._tkphoto.width(), canvas._tkphoto.height()) == (500, 375)
+        # resize() derives inches as pixels/dpi, so the figure itself is untouched
+        assert tuple(round(v, 3) for v in fig.get_size_inches()) == (4.0, 3.0)
+    finally:
+        plt.close(fig)
+        root.destroy()
