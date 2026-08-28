@@ -36,7 +36,6 @@ import re
 import shlex
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 STEP_RE = re.compile(r"\[step (\d+)\]")
