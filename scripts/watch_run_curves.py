@@ -548,11 +548,22 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
     canvas = FigureCanvasTkAgg(fig, master=viewport)
     widget = canvas.get_tk_widget()
     widget.configure(bg=palette["figure"], highlightthickness=0)
+    # FigureCanvasTk binds <Configure> to resize the figure to its widget. Inside
+    # a scrolling canvas that event fires as the widget is scrolled and remapped,
+    # so scrolling silently rescaled the plot -- the figure must keep the size
+    # the zoom controls give it, and the widget follow the figure, not the other
+    # way round.
+    widget.unbind("<Configure>")
     viewport.create_window((0, 0), window=widget, anchor="nw")
+
+    def size_widget_to_figure() -> None:
+        width, height = (int(round(v * fig.dpi)) for v in fig.get_size_inches())
+        widget.configure(width=width, height=height)
 
     state: dict = {"runs": None, "busy": False}
 
     def rescroll() -> None:
+        size_widget_to_figure()
         widget.update_idletasks()
         viewport.configure(scrollregion=viewport.bbox("all"))
 
@@ -740,8 +751,15 @@ def main() -> int:
         """Draw parsed runs. No I/O: safe to call from a Tk callback."""
         live = runs[0]
         last = live["train"][-1]["step"] if live["train"] else 0
+        # Name the x mode: only the live run uses accumulation, so switching it
+        # moves that one line and leaves the axis range (set by a long accum-1
+        # run) alone -- which reads as "nothing happened" unless the title says.
+        mode = ("x: training samples (steps x accumulation)"
+                if view["x_axis"] == "batches" else "x: optimizer steps")
+        focus = "  |  focused on the live run" if view.get("focus_live") else ""
         title = (f"{live['label']} @ step {last}"
                  + (f"  +{len(runs) - 1} earlier run(s) overlaid" if len(runs) > 1 else "")
+                 + f"  |  {mode}{focus}"
                  + "\nloss is comparable only between runs with the same "
                    "--window_frames and task mix")
         draw(axes, runs, view, args.theme)

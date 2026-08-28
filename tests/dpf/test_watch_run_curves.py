@@ -246,3 +246,29 @@ def test_the_window_offers_zoom_and_fit_but_only_when_wired():
         assert view["focus_live"] is True and repaints == [1]
     finally:
         root.destroy()
+
+
+def test_switching_the_x_axis_rescales_a_run_that_accumulates():
+    """The toggle looked inert because only the live run uses accumulation, so
+    the axis range (set by a long accum-1 run) does not move -- only that one
+    line does. It is real: 930 optimizer steps are 3,720 training samples."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    live = {"label": "live", "accum": 4, "smooth": 10,
+            "train": [{"step": s, "train_loss": 0.5} for s in (10, 930)], "vals": []}
+    fig, axes = plt.subplots(len(watch.PANELS), 1)
+    axes = list(axes)
+    try:
+        ends = {}
+        for mode in ("batches", "step"):
+            watch.draw(axes, [live],
+                       {"x_axis": mode, "yscale": "linear", "smooth": 10, "focus_live": False},
+                       "light")
+            ends[mode] = axes[0].lines[-1].get_xdata()[-1]
+            assert axes[-1].get_xlabel().startswith(
+                "training samples" if mode == "batches" else "optimizer step")
+        assert ends["batches"] == 4 * ends["step"] == 3720
+    finally:
+        plt.close(fig)
