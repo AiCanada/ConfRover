@@ -149,3 +149,55 @@ def test_every_run_is_distinguishable_by_colour_and_again_without_it():
     # the series carry no colour of their own any more: the panel title names them
     assert all(len(entry) == 3 for entry in watch.SERIES)
     assert [name for _, _, name in watch.SERIES] == ["total", "forward", "iid"]
+
+
+# --- what the reader can change from the window ------------------------------
+
+
+def test_the_cli_offers_both_axes_and_both_scales():
+    parser = watch.build_parser()
+    args = parser.parse_args([])
+    assert args.x_axis == "batches" and args.yscale == "linear"
+    args = parser.parse_args(["--x", "step", "--yscale", "log"])
+    assert args.x_axis == "step" and args.yscale == "log"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--yscale", "sqrt"])
+
+
+def test_the_controls_write_into_the_view_the_plot_reads():
+    """Every control mutates the same dict draw() reads, then repaints: a switch
+    costs one redraw of already-parsed data, not a new run of the watcher."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # no display (CI)
+        pytest.skip(f"no Tk display: {exc}")
+    try:
+        root.withdraw()
+        view = {"x_axis": "batches", "yscale": "linear", "smooth": None}
+        redraws = []
+        controls = watch.build_controls(tk.Frame(root), watch.CARBON, view, lambda: redraws.append(1))
+
+        controls["x"].set("step")
+        controls["on_x"]()
+        assert view["x_axis"] == "step"
+
+        controls["y"].set("log")
+        controls["on_y"]()
+        assert view["yscale"] == "log"
+
+        controls["smooth"].set("25")
+        controls["on_smooth"]()
+        assert view["smooth"] == 25
+
+        controls["smooth"].set("auto")
+        controls["on_smooth"]()
+        assert view["smooth"] is None
+        assert len(redraws) == 4
+
+        controls["smooth"].set("not a number")  # a typo must not kill the window
+        controls["on_smooth"]()
+        assert view["smooth"] is None and len(redraws) == 4
+        assert controls["smooth"].get() == "auto"
+    finally:
+        root.destroy()

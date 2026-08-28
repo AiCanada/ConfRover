@@ -15,6 +15,13 @@ so the live window is a scrolling canvas (wheel scrolls; ``--no_scroll`` for the
 plain matplotlib window). ``--theme carbon`` (the default) paints a woven
 graphite skin behind dark panels; ``--theme light`` is the plain one.
 
+The bar above the figure changes the view without restarting the watch: the x
+axis between training samples (steps x accumulation, comparable across runs)
+and raw optimizer steps, the y scale between linear and log (log spreads out a
+plateau, linear keeps differences in proportion), and the smoothing window
+(a number, or ``auto`` to scale it with each run's length). ``--x``, ``--yscale``
+and ``--smooth`` set where it starts.
+
     # the cloud run, over ssh, refreshing every minute
     py -3.13 scripts/watch_run_curves.py --host 170.64.254.80 --port 27032 ^
         --key %USERPROFILE%\\.ssh\\id_ed25519 ^
@@ -350,7 +357,7 @@ def write_csv(path: Path, runs: list[dict]) -> None:
                                  "batches": row["step"] * accum, **row})
 
 
-def draw(axes, runs: list[dict], smooth: int | None, x_axis: str, theme: str) -> None:
+def draw(axes, runs: list[dict], view: dict, theme: str) -> None:
     """Six panels stacked on one x axis: train total/forward/iid, then val.
 
     One quantity per panel, so nothing hides behind anything else and each gets
@@ -361,6 +368,7 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str, theme: str) ->
         ax.clear()
     palette = CARBON if theme == "carbon" else LIGHT
     solo = len(runs) == 1
+    smooth, x_axis = view["smooth"], view["x_axis"]
 
     for index, run in enumerate(runs):
         style = RUN_STYLES[index % len(RUN_STYLES)]
@@ -406,6 +414,8 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str, theme: str) ->
         ax.grid(alpha=0.35, color=palette["grid"], linewidth=0.6)
         ax.set_ylabel("rolling mean" if kind == "train" else "fixed bag, t grid",
                       fontsize=8, color=palette["muted"])
+    for ax in axes:
+        ax.set_yscale(view["yscale"])
     axes[-1].set_xlabel("training samples (steps x accumulation)"
                         if x_axis == "batches" else "optimizer step",
                         color=palette["text"])
@@ -434,13 +444,73 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str, theme: str) ->
         legend.get_title().set_color(palette["text"])
 
 
-def show_scrollable(fig, interval: float, refresh, theme: str) -> int:
+def build_controls(parent, palette: dict, view: dict, redraw) -> dict:
+    """The bar above the figure: what the reader can change without restarting.
+
+    Every control writes into ``view`` -- the same dict :func:`draw` reads -- and
+    then redraws, so a switch costs one repaint of already-parsed data rather
+    than a new run of the watcher. Returned handlers are what the tests drive,
+    since a Tk button cannot be clicked from a test.
+    """
+    import tkinter as tk
+
+    x_var = tk.StringVar(value=view["x_axis"])
+    y_var = tk.StringVar(value=view["yscale"])
+    smooth_var = tk.StringVar(value="auto" if view["smooth"] is None else str(view["smooth"]))
+
+    def on_x() -> None:
+        view["x_axis"] = x_var.get()
+        redraw()
+
+    def on_y() -> None:
+        view["yscale"] = y_var.get()
+        redraw()
+
+    def on_smooth() -> None:
+        text = smooth_var.get().strip().lower()
+        try:
+            view["smooth"] = None if text in ("", "auto") else max(1, int(text))
+        except ValueError:  # a typo must not kill the window
+            smooth_var.set("auto" if view["smooth"] is None else str(view["smooth"]))
+            return
+        redraw()
+
+    label_kw = {"bg": palette["figure"], "fg": palette["muted"]}
+    radio_kw = {"bg": palette["figure"], "fg": palette["text"],
+                "selectcolor": palette["axes"], "activebackground": palette["figure"],
+                "activeforeground": palette["text"], "highlightthickness": 0}
+    button_kw = {"bg": palette["axes"], "fg": palette["text"],
+                 "activebackground": palette["spine"], "activeforeground": palette["text"],
+                 "highlightthickness": 0, "relief": tk.FLAT}
+    tk.Label(parent, text="x axis:", **label_kw).pack(side=tk.LEFT, padx=(10, 2))
+    for text, value in (("training samples", "batches"), ("optimizer steps", "step")):
+        tk.Radiobutton(parent, text=text, variable=x_var, value=value,
+                       command=on_x, **radio_kw).pack(side=tk.LEFT)
+    tk.Label(parent, text="   y scale:", **label_kw).pack(side=tk.LEFT, padx=(14, 2))
+    for value in ("linear", "log"):
+        tk.Radiobutton(parent, text=value, variable=y_var, value=value,
+                       command=on_y, **radio_kw).pack(side=tk.LEFT)
+    tk.Label(parent, text="   smoothing:", **label_kw).pack(side=tk.LEFT, padx=(14, 2))
+    entry = tk.Entry(parent, textvariable=smooth_var, width=6, bg=palette["axes"],
+                     fg=palette["text"], insertbackground=palette["text"],
+                     highlightthickness=0)
+    entry.pack(side=tk.LEFT)
+    entry.bind("<Return>", lambda _event: on_smooth())
+    tk.Button(parent, text="apply", command=on_smooth, **button_kw).pack(side=tk.LEFT, padx=4)
+    tk.Button(parent, text="refresh now", command=redraw, **button_kw).pack(side=tk.LEFT, padx=10)
+    return {"x": x_var, "y": y_var, "smooth": smooth_var,
+            "on_x": on_x, "on_y": on_y, "on_smooth": on_smooth}
+
+
+def show_scrollable(fig, interval: float, refresh, theme: str, view: dict) -> int:
     """The figure in a window with scroll bars, redrawn every ``interval`` s.
 
     Six stacked panels are taller than a screen, and a matplotlib window only
     squashes them. A Tk canvas holding the figure at its natural size scrolls
-    instead, with the wheel bound to the vertical bar. Falls back to the plain
-    matplotlib window if Tk is unavailable.
+    instead, with the wheel bound to the vertical bar. The bar along the top
+    switches the x axis between training samples and optimizer steps, and the y
+    scale between linear and log, without restarting the watch. Falls back to
+    the plain matplotlib window if Tk is unavailable.
     """
     import tkinter as tk
 
@@ -450,6 +520,8 @@ def show_scrollable(fig, interval: float, refresh, theme: str) -> int:
     root = tk.Tk()
     root.title("ConfRover training")
     root.configure(bg=palette["figure"])
+    controls = tk.Frame(root, bg=palette["figure"], pady=4)
+    controls.pack(fill=tk.X)
     frame = tk.Frame(root, bg=palette["figure"])
     frame.pack(fill=tk.BOTH, expand=True)
     viewport = tk.Canvas(frame, bg=palette["figure"], highlightthickness=0)
@@ -477,6 +549,16 @@ def show_scrollable(fig, interval: float, refresh, theme: str) -> int:
         root.bind_all(sequence, on_wheel)
     root.geometry("1280x900")
 
+    def redraw_now() -> None:
+        try:
+            refresh()
+        except Exception as exc:  # noqa: BLE001 - reported, the watch goes on
+            print(f"redraw failed: {exc}", file=sys.stderr)
+        canvas.draw_idle()
+        rescroll()
+
+    build_controls(controls, palette, view, redraw_now)
+
     def tick() -> None:
         try:
             refresh()
@@ -491,7 +573,7 @@ def show_scrollable(fig, interval: float, refresh, theme: str) -> int:
     return 0
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -512,8 +594,13 @@ def main() -> int:
                         help="Rolling-mean window in heartbeats; default scales "
                              "with each run's length (10-200).")
     parser.add_argument("--x", dest="x_axis", choices=("batches", "step"), default="batches",
-                        help="x axis: training samples (default, comparable across "
-                             "accumulation settings) or raw optimizer steps.")
+                        help="Initial x axis: training samples (default, comparable "
+                             "across accumulation settings) or raw optimizer steps. "
+                             "The live window can switch between them.")
+    parser.add_argument("--yscale", choices=("linear", "log"), default="linear",
+                        help="Initial y scale; the live window can switch it. log "
+                             "spreads out a plateau, linear keeps the differences "
+                             "in proportion.")
     parser.add_argument("--theme", choices=("carbon", "light"), default="carbon",
                         help="carbon: woven graphite skin, dark panels (default).")
     parser.add_argument("--panel_height", type=float, default=2.6,
@@ -524,7 +611,11 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Render once and exit (no window).")
     parser.add_argument("--out", type=Path, help="Also save the figure here (PNG).")
     parser.add_argument("--csv", type=Path, help="Write the parsed series as CSV.")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     sources: list[tuple[str, LogSource]] = []
     if args.log is not None:
@@ -558,6 +649,8 @@ def main() -> int:
     )
     axes = list(axes)
     palette = apply_theme(fig, axes, args.theme)
+    #: What the window's controls change without restarting the watch.
+    view = {"x_axis": args.x_axis, "yscale": args.yscale, "smooth": args.smooth}
 
     def refresh() -> list[dict]:
         runs: list[dict] = []
@@ -577,7 +670,7 @@ def main() -> int:
                  + (f"  +{len(runs) - 1} earlier run(s) overlaid" if len(runs) > 1 else "")
                  + "\nloss is comparable only between runs with the same "
                    "--window_frames and task mix")
-        draw(axes, runs, args.smooth, args.x_axis, args.theme)
+        draw(axes, runs, view, args.theme)
         apply_theme(fig, axes, args.theme)
         fig.suptitle(title, fontsize=9, color=palette["text"])
         fig.tight_layout(rect=(0, 0, 1, 0.97))
@@ -598,7 +691,7 @@ def main() -> int:
 
     if not args.no_scroll:
         try:
-            return show_scrollable(fig, args.interval, refresh, args.theme)
+            return show_scrollable(fig, args.interval, refresh, args.theme, view)
         except Exception as exc:  # no Tk, no display: fall back rather than fail
             print(f"scrollable window unavailable ({exc}); plain window instead",
                   file=sys.stderr)
