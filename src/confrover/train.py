@@ -323,11 +323,16 @@ class StepHeartbeat(Callback):
         if terms:
             self._last_val_terms = terms
 
-    def _accumulate_batch(self, outputs, batch) -> None:
+    def _accumulate_batch(self, outputs, batch, scale: float = 1.0) -> None:
         loss = outputs.get("loss") if isinstance(outputs, dict) else outputs
         parsed_loss = _metric_as_float(loss)
         mode = batch.get("task_mode") if isinstance(batch, dict) else None
         if parsed_loss is not None:
+            # Lightning hands callbacks the loss it backpropagated, i.e. divided
+            # by --accumulate_grad_batches; undo that so the heartbeat reads in
+            # the same units as val_loss and as runs without accumulation
+            # (dpf_from_base_v2 printed 0.114 next to Lightning's own 0.438).
+            parsed_loss *= float(scale)
             self._loss_sum += parsed_loss
             self._loss_count += 1
             if mode in self._task_loss_sums:
@@ -368,7 +373,10 @@ class StepHeartbeat(Callback):
     ) -> None:  # noqa: D102
         if self.every_n_steps <= 0:
             return
-        self._accumulate_batch(outputs, batch)
+        self._accumulate_batch(
+            outputs, batch,
+            scale=max(int(getattr(trainer, "accumulate_grad_batches", 1) or 1), 1),
+        )
 
         step = int(trainer.global_step)
         if step == self._last_report_step or step % self.every_n_steps:
@@ -596,6 +604,12 @@ def _epoch_batches_done(trainer, batch_idx: int | None = None) -> tuple[int, int
         n_epoch = 0
     if n_epoch <= 0 or n_epoch > 10**8:
         n_epoch = 0
+    # global_step counts optimizer steps; with --accumulate_grad_batches N an
+    # epoch of B batches is ceil(B / N) of them. Counting steps against a batch
+    # total showed 100/1216 after 400 batches on dpf_from_base_v2.
+    accum = max(int(getattr(trainer, "accumulate_grad_batches", 1) or 1), 1)
+    if n_epoch > 0 and accum > 1:
+        n_epoch = -(-n_epoch // accum)
 
     done: int | None = None
     try:

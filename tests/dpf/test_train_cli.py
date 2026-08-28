@@ -2418,3 +2418,29 @@ def test_ema_decay_must_be_a_fraction():
         train_cli.EmaWeights(1.0)
     with pytest.raises(ValueError):
         train_cli.EmaWeights(0.0)
+
+
+def test_heartbeat_unscales_the_accumulated_loss(caplog):
+    """Lightning hands callbacks the loss it backpropagated, divided by
+    --accumulate_grad_batches. dpf_from_base_v2 (accumulate 4) printed
+    train_loss=0.114 next to Lightning's own train/loss_step 0.438."""
+    hb = train_cli.StepHeartbeat(every_n_steps=1)
+    hb._accumulate_batch({"loss": torch.tensor(0.1)}, {"task_mode": "iid"}, scale=4)
+    assert hb._loss_sum == pytest.approx(0.4)
+    hb._accumulate_batch({"loss": torch.tensor(0.1)}, {"task_mode": "forward"})
+    assert hb._loss_sum == pytest.approx(0.5)
+
+
+def test_epoch_progress_counts_optimizer_steps_against_optimizer_steps():
+    """global_step is optimizer steps; with accumulation an epoch of 1216
+    batches is 304 of them. The bar showed 100/1216 after 400 batches."""
+    tr = _epoch_trainer(ready=0, total=1216, epoch=0)
+    tr.global_step = 100
+    tr.accumulate_grad_batches = 4
+    done, total = train_cli._epoch_batches_done(tr)
+    assert (done, total) == (100, 304)
+    tr.accumulate_grad_batches = 1
+    assert train_cli._epoch_batches_done(tr) == (100, 1216)
+    tr.current_epoch, tr.global_step = 2, 700
+    tr.accumulate_grad_batches = 4
+    assert train_cli._epoch_batches_done(tr) == (700 - 2 * 304, 304)
