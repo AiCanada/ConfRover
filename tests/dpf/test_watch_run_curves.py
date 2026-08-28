@@ -140,10 +140,12 @@ def test_run_specs_accept_a_local_path_and_an_ssh_source(tmp_path):
     assert source.remote_log == "/workspace/runs/r/logs/console.log"
 
 
-def test_every_run_gets_a_distinct_thickness_and_marker_but_not_a_colour():
-    """Colour is the series, so the same quantity looks the same in every run."""
-    seen = {(s["linewidth"], s["marker"]) for s in watch.RUN_STYLES}
-    assert len(seen) == len(watch.RUN_STYLES)
-    assert "color" not in {k for s in watch.RUN_STYLES for k in s}
-    colours = [colour for _, _, _, colour in watch.SERIES]
-    assert len(set(colours)) == 3
+def test_every_run_is_distinguishable_by_colour_and_again_without_it():
+    """Each panel holds one series, so colour identifies the run -- and
+    thickness plus marker say it again, so the figure survives greyscale."""
+    styles = watch.RUN_STYLES
+    assert len({s["color"] for s in styles}) == len(styles)
+    assert len({(s["linewidth"], s["marker"]) for s in styles}) == len(styles)
+    # the series carry no colour of their own any more: the panel title names them
+    assert all(len(entry) == 3 for entry in watch.SERIES)
+    assert [name for _, _, name in watch.SERIES] == ["total", "forward", "iid"]

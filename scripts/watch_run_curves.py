@@ -29,9 +29,10 @@ so nothing hides behind anything else and each gets its own y range.
         --run "stage2=A:\\ATLAS DATA\\remote_payload\\run\\dpf_from_PDBcluster\\logs\\console.log" ^
         --run "v888=runs\\dpf_base_train_v888\\logs\\console.log"
 
-Colour is the series (total / forward / iid) and never the run, so the same
-quantity is the same colour everywhere; runs are told apart by line thickness
-and marker shape, listed in the second legend. The x axis is training samples
+Each panel holds one series, so colour identifies the run -- with thickness and
+marker repeating it for a greyscale or colour-blind reader. The run legend on
+the first panel carries each run's accumulation factor, best val_forward and
+smoothing window. The x axis is training samples
 (optimizer steps x the accumulation factor, inferred per run from its own
 ``samples=`` counter), so a run with --accumulate_grad_batches 4 lines up with
 one without it.
@@ -185,19 +186,22 @@ def rolling(values: list[float | None], window: int) -> list[float | None]:
     return out
 
 
-#: How runs are told apart: colour is the series, never the run.
+#: How runs are told apart. Each panel holds one series, so colour is free to
+#: mean the run; thickness and marker repeat that so the figure survives
+#: greyscale printing and colour-blind readers.
 RUN_STYLES = [
-    {"linewidth": 2.4, "marker": "o"},
-    {"linewidth": 1.7, "marker": "s"},
-    {"linewidth": 1.2, "marker": "^"},
-    {"linewidth": 0.9, "marker": "D"},
-    {"linewidth": 0.7, "marker": "v"},
-    {"linewidth": 0.6, "marker": "P"},
+    {"color": "tab:blue", "linewidth": 2.4, "marker": "o"},
+    {"color": "tab:red", "linewidth": 1.7, "marker": "s"},
+    {"color": "tab:green", "linewidth": 1.2, "marker": "^"},
+    {"color": "tab:purple", "linewidth": 0.9, "marker": "D"},
+    {"color": "tab:brown", "linewidth": 0.9, "marker": "v"},
+    {"color": "tab:olive", "linewidth": 0.9, "marker": "P"},
 ]
+#: (train key, val key, panel name); one column of the grid each.
 SERIES = (
-    ("train_loss", "val_loss", "total", "tab:blue"),
-    ("train_fwd", "val_fwd", "forward", "tab:orange"),
-    ("train_iid", "val_iid", "iid", "tab:green"),
+    ("train_loss", "val_loss", "total"),
+    ("train_fwd", "val_fwd", "forward"),
+    ("train_iid", "val_iid", "iid"),
 )
 
 
@@ -262,8 +266,8 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
 
     One quantity per panel, so a series is never hidden behind another and each
     gets its own y range (iid sits well above forward, and the train and val
-    scales differ). Colour still belongs to the series, and runs are told apart
-    by line thickness and marker shape.
+    scales differ). With one series per panel, colour identifies the *run*;
+    thickness and marker say the same thing again for a greyscale reader.
     """
     for ax in axes.flat:
         ax.clear()
@@ -279,7 +283,8 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
         steps = [r["step"] * scale for r in train]
         vsteps = [r["step"] * scale for r in vals]
 
-        for column, (train_key, val_key, name, colour) in enumerate(SERIES):
+        colour = style["color"]
+        for column, (train_key, val_key, _name) in enumerate(SERIES):
             ax_train, ax_val = axes[0][column], axes[1][column]
 
             pts = [(s, r.get(train_key)) for s, r in zip(steps, train)
@@ -305,9 +310,9 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
                                     textcoords="offset points", xytext=(5, -11),
                                     fontsize=7.5, color=colour)
 
-    for column, (_train_key, _val_key, name, colour) in enumerate(SERIES):
-        axes[0][column].set_title(f"train {name}", fontsize=10, color=colour)
-        axes[1][column].set_title(f"val {name}", fontsize=10, color=colour)
+    for column, (_train_key, _val_key, name) in enumerate(SERIES):
+        axes[0][column].set_title(f"train {name}", fontsize=11)
+        axes[1][column].set_title(f"val {name}", fontsize=11)
         for row in (0, 1):
             axes[row][column].grid(alpha=0.25)
         axes[1][column].set_xlabel("training samples (steps x accumulation)"
@@ -328,7 +333,7 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
         if best is not None:
             label += f"  best val_fwd {best:.4f}"
         label += f"  [mean {run.get('smooth', '?')}]"
-        handles.append(Line2D([], [], color="0.35", linewidth=style["linewidth"],
+        handles.append(Line2D([], [], color=style["color"], linewidth=style["linewidth"],
                               marker=style["marker"], markersize=4, label=label))
     axes[0][0].legend(handles=handles, loc="upper right", fontsize=7.5,
                       title="run" if not solo else None, framealpha=0.9)
