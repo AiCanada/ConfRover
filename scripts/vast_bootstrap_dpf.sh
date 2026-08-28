@@ -107,7 +107,17 @@ hf download "$HF_REPO" --repo-type dataset --local-dir "$DL" --max-workers "${HF
   --exclude "checkpoints/*"
 
 if [[ ! -f "$WEIGHTS" ]]; then
-  echo "stage-1 weights not at $WEIGHTS; fetching $WEIGHTS_REPO/$WEIGHTS_PATH_IN_REPO"
+  # The fallback may only fetch the *same* file from the Hub, never a different
+  # one: with WEIGHTS pointing at a misspelled base-weights path this once
+  # substituted the stage-1 export and a "from base" run started from the
+  # cluster weights. Same basename or stop.
+  if [[ "$(basename "$WEIGHTS")" != "$(basename "$WEIGHTS_PATH_IN_REPO")" ]]; then
+    echo "ERROR: start weights not found: $WEIGHTS" >&2
+    echo "       (Hub fallback $WEIGHTS_REPO/$WEIGHTS_PATH_IN_REPO is a different file; set WEIGHTS to an existing file" >&2
+    echo "        -- the payload's original base is $DATA/confrover_ckpts/confrover_base_20m_v1_0.pt)" >&2
+    exit 1
+  fi
+  echo "weights not at $WEIGHTS; fetching the same file from $WEIGHTS_REPO/$WEIGHTS_PATH_IN_REPO"
   hf download "$WEIGHTS_REPO" "$WEIGHTS_PATH_IN_REPO" --repo-type dataset --local-dir "$DL/stage1"
   WEIGHTS="$DL/stage1/$WEIGHTS_PATH_IN_REPO"
 fi
