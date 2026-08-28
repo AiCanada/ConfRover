@@ -164,9 +164,10 @@ def test_the_cli_offers_both_axes_and_both_scales():
         parser.parse_args(["--yscale", "sqrt"])
 
 
-def test_the_controls_write_into_the_view_the_plot_reads():
-    """Every control mutates the same dict draw() reads, then repaints: a switch
-    costs one redraw of already-parsed data, not a new run of the watcher."""
+def test_the_x_axis_control_repaints_without_reading_anything():
+    """Tk callbacks run on the thread that draws the window, so a control that
+    read the logs froze it for the whole ssh round trip -- which is what
+    happened. The handler may only write into the view and repaint."""
     tk = pytest.importorskip("tkinter")
     try:
         root = tk.Tk()
@@ -175,29 +176,73 @@ def test_the_controls_write_into_the_view_the_plot_reads():
     try:
         root.withdraw()
         view = {"x_axis": "batches", "yscale": "linear", "smooth": None}
-        redraws = []
-        controls = watch.build_controls(tk.Frame(root), watch.CARBON, view, lambda: redraws.append(1))
-
+        repaints, fetches = [], []
+        controls = watch.build_controls(
+            tk.Frame(root), watch.CARBON, view,
+            lambda: repaints.append(1), lambda: fetches.append(1),
+        )
         controls["x"].set("step")
         controls["on_x"]()
         assert view["x_axis"] == "step"
+        assert repaints == [1] and fetches == [], "the toggle must not fetch"
 
-        controls["y"].set("log")
-        controls["on_y"]()
-        assert view["yscale"] == "log"
+        controls["x"].set("batches")
+        controls["on_x"]()
+        assert view["x_axis"] == "batches" and len(repaints) == 2
+    finally:
+        root.destroy()
 
-        controls["smooth"].set("25")
-        controls["on_smooth"]()
-        assert view["smooth"] == 25
 
-        controls["smooth"].set("auto")
-        controls["on_smooth"]()
-        assert view["smooth"] is None
-        assert len(redraws) == 4
+def test_focus_live_limits_the_x_range_to_the_newest_run():
+    """A 900-step run beside a 37,000-step one is a sliver at the origin. With
+    focus on, the newest run fills the width and the older ones are read where
+    they overlap it."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-        controls["smooth"].set("not a number")  # a typo must not kill the window
-        controls["on_smooth"]()
-        assert view["smooth"] is None and len(redraws) == 4
-        assert controls["smooth"].get() == "auto"
+    live = {"label": "live", "accum": 4, "smooth": 10,
+            "train": [{"step": s, "train_loss": 0.5, "train_fwd": 0.4, "train_iid": 0.6}
+                      for s in (10, 200)],
+            "vals": [{"step": 125, "val_loss": 0.5, "val_fwd": 0.44, "val_iid": 0.6}]}
+    old = {"label": "old", "accum": 1, "smooth": 50,
+           "train": [{"step": s, "train_loss": 0.5, "train_fwd": 0.4, "train_iid": 0.6}
+                     for s in (10, 36000)],
+           "vals": [{"step": 36000, "val_loss": 0.5, "val_fwd": 0.42, "val_iid": 0.6}]}
+
+    fig, axes = plt.subplots(len(watch.PANELS), 1)
+    axes = list(axes)
+    try:
+        view = {"x_axis": "batches", "yscale": "linear", "smooth": 10, "focus_live": False}
+        watch.draw(axes, [live, old], view, "light")
+        assert axes[0].get_xlim()[1] > 30000, "unfocused, the long run sets the range"
+
+        view["focus_live"] = True
+        watch.draw(axes, [live, old], view, "light")
+        # the live run ends at step 200 x accumulation 4 = 800 samples
+        assert 800 <= axes[0].get_xlim()[1] <= 900
+        assert axes[-1].get_xlim() == axes[0].get_xlim(), "every panel shares it"
+    finally:
+        plt.close(fig)
+
+
+def test_the_window_offers_zoom_and_fit_but_only_when_wired():
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"no Tk display: {exc}")
+    try:
+        root.withdraw()
+        view = {"x_axis": "batches", "yscale": "linear", "smooth": None, "focus_live": False}
+        repaints, zooms, fits = [], [], []
+        controls = watch.build_controls(
+            tk.Frame(root), watch.CARBON, view,
+            lambda: repaints.append(1), lambda: None,
+            on_zoom=lambda factor: zooms.append(factor), on_fit=lambda: fits.append(1),
+        )
+        controls["focus"].set(True)
+        controls["on_focus"]()
+        assert view["focus_live"] is True and repaints == [1]
     finally:
         root.destroy()
