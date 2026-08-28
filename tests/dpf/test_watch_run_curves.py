@@ -288,3 +288,33 @@ def test_the_seventh_panel_is_the_learning_rate_the_run_applied():
         assert lr_axis.get_title(loc="left") == "learning rate"
     finally:
         plt.close(fig)
+
+
+def test_the_live_only_button_flips_both_ways_and_says_which_it_is():
+    """A Checkbutton read as dead here: its indicator is drawn in the theme's
+    panel colour, which on the carbon skin is nearly the background, so the
+    state was invisible. The button carries its own state in its label."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # no display (CI)
+        pytest.skip(f"no Tk display: {exc}")
+    try:
+        root.withdraw()
+        view = {"yscale": "linear", "smooth": None, "live_only": False}
+        repaints = []
+        widgets = watch.build_controls(tk.Frame(root), watch.CARBON, view,
+                                       lambda: repaints.append(1), lambda: None)
+        button = widgets["button"]
+        assert button.cget("text") == "showing: all runs"
+
+        widgets["toggle_live_only"]()
+        assert view["live_only"] is True
+        assert button.cget("text") == "showing: live run only"
+
+        widgets["toggle_live_only"]()  # and back again
+        assert view["live_only"] is False
+        assert button.cget("text") == "showing: all runs"
+        assert len(repaints) == 2
+    finally:
+        root.destroy()

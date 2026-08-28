@@ -16,9 +16,10 @@ plain matplotlib window). ``--theme carbon`` (the default) paints a woven
 graphite skin behind dark panels; ``--theme light`` is the plain one.
 
 The x axis is the optimizer step for every run. The bar above the figure
-changes the view without restarting the watch or re-reading anything: "live run
-only", which drops the overlaid runs so a 1,000-step run is not a sliver beside
-a 37,000-step one; zoom, which resizes the figure inside the scrolling canvas;
+changes the view without restarting the watch or re-reading anything: a button
+that flips between "showing: all runs" and "showing: live run only" (the
+overlaid runs leave the figure, so a 1,000-step run is not a sliver beside a
+37,000-step one); zoom, which resizes the figure inside the scrolling canvas;
 "fit width"; and "fit all 6". The matplotlib toolbar along the bottom adds pan,
 rectangle zoom and home. ``--yscale``, ``--smooth`` and ``--live_only`` set
 where it starts.
@@ -495,18 +496,39 @@ def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
     """
     import tkinter as tk
 
+    widgets: dict = {}
     live_var = tk.BooleanVar(value=bool(view.get("live_only")))
 
+    def live_label() -> str:
+        return "showing: live run only" if live_var.get() else "showing: all runs"
+
     def on_live_only() -> None:
+        """Flip and say so in the label.
+
+        A Checkbutton was ambiguous here: its indicator is drawn in the theme's
+        panel colour, which on the carbon skin is nearly the background, so the
+        state was invisible and the control read as dead.
+        """
         view["live_only"] = bool(live_var.get())
+        if "button" in widgets:
+            widgets["button"].configure(text=live_label())
         on_change()
+
+    def toggle_live_only() -> None:
+        live_var.set(not live_var.get())
+        on_live_only()
 
     label_kw = {"bg": palette["figure"], "fg": palette["muted"]}
     radio_kw = {"bg": palette["figure"], "fg": palette["text"],
                 "selectcolor": palette["axes"], "activebackground": palette["figure"],
                 "activeforeground": palette["text"], "highlightthickness": 0}
-    tk.Checkbutton(parent, text="live run only", variable=live_var, command=on_live_only,
-                   **radio_kw).pack(side=tk.LEFT, padx=(10, 2))
+    live_button = tk.Button(parent, text=live_label(), command=toggle_live_only,
+                            bg=palette["axes"], fg=palette["text"],
+                            activebackground=palette["spine"],
+                            activeforeground=palette["text"], highlightthickness=0,
+                            relief="flat", width=22)
+    live_button.pack(side=tk.LEFT, padx=(10, 2))
+    widgets["button"] = live_button
     button_kw = {"bg": palette["axes"], "fg": palette["text"],
                  "activebackground": palette["spine"], "activeforeground": palette["text"],
                  "highlightthickness": 0, "relief": "flat", "width": 3}
@@ -526,7 +548,9 @@ def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
               fg=palette["text"], activebackground=palette["spine"],
               activeforeground=palette["text"], highlightthickness=0,
               relief="flat").pack(side=tk.RIGHT, padx=10)
-    return {"live_only": live_var, "on_live_only": on_live_only, "status": status}
+    widgets.update({"live_only": live_var, "on_live_only": on_live_only,
+                    "toggle_live_only": toggle_live_only, "status": status})
+    return widgets
 
 
 def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict) -> int:
@@ -594,11 +618,15 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
         widget.update_idletasks()
 
     def repaint() -> None:
-        """Draw what is already parsed. No I/O, so this is safe on the UI thread."""
+        """Draw what is already parsed. No I/O, so this is safe on the UI thread.
+
+        ``draw()``, not ``draw_idle()``: a control click has to show its effect
+        at once, and idle can be a while away with a fetch thread in flight.
+        """
         if state["runs"] is None:
             return
         render(state["runs"])
-        canvas.draw_idle()
+        canvas.draw()
         rescroll()
 
     def on_zoom(factor: float) -> None:
