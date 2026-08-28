@@ -89,13 +89,61 @@ def test_a_shell_rewritten_remote_path_is_recovered(raw, want):
     assert watch.unmangle_remote_path(raw) == want
 
 
-def test_csv_round_trips_both_series(tmp_path):
+def test_csv_round_trips_every_run(tmp_path):
     import csv as csv_mod
 
     train, vals = watch.parse_console(CONSOLE)
     out = tmp_path / "curves.csv"
-    watch.write_csv(out, train, vals)
+    watch.write_csv(out, [{"label": "v2", "train": train, "vals": vals, "accum": 4}])
     rows = list(csv_mod.DictReader(out.open(encoding="utf-8")))
     assert [r["kind"] for r in rows] == ["train", "train", "val", "val"]
+    assert {r["run"] for r in rows} == {"v2"}
     assert rows[0]["train_fwd"] == "0.42231"
     assert rows[2]["val_iid"] == "0.59527"
+    # batches = step x accumulation, the axis runs are compared on
+    assert rows[0]["batches"] == "40" and rows[2]["batches"] == "500"
+
+
+# --- overlaying several runs -------------------------------------------------
+
+
+def test_accumulation_is_inferred_from_the_runs_own_counters():
+    """samples= counts this process's samples and restarts on a resume, while
+    step does not (v888 ends at samples=2,805, step=5,265 over three restarts).
+    Deltas survive that; their ratio is --accumulate_grad_batches."""
+    accum4 = [{"step": 10, "samples": 40}, {"step": 20, "samples": 80}, {"step": 30, "samples": 120}]
+    assert watch.infer_accumulation(accum4) == 4
+    plain = [{"step": 10, "samples": 10}, {"step": 20, "samples": 20}]
+    assert watch.infer_accumulation(plain) == 1
+    resumed = [  # the reset drops out: its delta is negative
+        {"step": 10, "samples": 10}, {"step": 20, "samples": 20},
+        {"step": 30, "samples": 5}, {"step": 40, "samples": 15},
+    ]
+    assert watch.infer_accumulation(resumed) == 1
+    assert watch.infer_accumulation([{"step": 10}, {"step": 20}]) == 1, "logs predating samples="
+
+
+def test_run_specs_accept_a_local_path_and_an_ssh_source(tmp_path):
+    label, source = watch.parse_run_spec(f"stage2={tmp_path / 'console.log'}")
+    assert label == "stage2" and source.host is None and source.log == tmp_path / "console.log"
+
+    label, source = watch.parse_run_spec(
+        "v2=root@1.2.3.4:27032:/workspace/runs/r/logs/console.log"
+    )
+    assert label == "v2" and source.host == "1.2.3.4" and source.port == 27032
+    assert source.user == "root" and source.remote_log == "/workspace/runs/r/logs/console.log"
+
+    # a shell-rewritten remote path is recovered here too
+    _, source = watch.parse_run_spec(
+        "v2=root@1.2.3.4:27032:C:/Program Files/Git/workspace/runs/r/logs/console.log"
+    )
+    assert source.remote_log == "/workspace/runs/r/logs/console.log"
+
+
+def test_every_run_gets_a_distinct_thickness_and_marker_but_not_a_colour():
+    """Colour is the series, so the same quantity looks the same in every run."""
+    seen = {(s["linewidth"], s["marker"]) for s in watch.RUN_STYLES}
+    assert len(seen) == len(watch.RUN_STYLES)
+    assert "color" not in {k for s in watch.RUN_STYLES for k in s}
+    colours = [colour for _, _, _, colour in watch.SERIES]
+    assert len(set(colours)) == 3
