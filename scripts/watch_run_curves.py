@@ -20,7 +20,7 @@ changes the view without restarting the watch or re-reading anything: a button
 that flips between "showing: all runs" and "showing: live run only" (the
 overlaid runs leave the figure, so a 1,000-step run is not a sliver beside a
 37,000-step one); zoom, which resizes the figure inside the scrolling canvas;
-"fit width"; and "fit all 6". The matplotlib toolbar along the bottom adds pan,
+and "fit width". The matplotlib toolbar along the bottom adds pan,
 rectangle zoom and home. ``--yscale``, ``--smooth`` and ``--live_only`` set
 where it starts.
 
@@ -486,7 +486,7 @@ def draw(axes, runs: list[dict], view: dict, theme: str) -> None:
 
 
 def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
-                   on_zoom=None, on_fit=None, on_fit_page=None) -> dict:
+                   on_zoom=None, on_fit=None) -> dict:
     """The bar above the figure: what is shown, and how large.
 
     The handlers must never touch the network: they write into ``view`` -- the
@@ -539,9 +539,6 @@ def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
     if on_fit is not None:
         tk.Button(parent, text="fit width", command=on_fit, **{**button_kw, "width": 8}).pack(
             side=tk.LEFT, padx=(6, 2))
-    if on_fit_page is not None:
-        tk.Button(parent, text="fit all 6", command=on_fit_page,
-                  **{**button_kw, "width": 8}).pack(side=tk.LEFT)
     status = tk.Label(parent, text="", **label_kw)
     status.pack(side=tk.LEFT, padx=(16, 2))
     tk.Button(parent, text="refresh now", command=on_refresh, bg=palette["axes"],
@@ -599,15 +596,22 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
     window_id = viewport.create_window((0, 0), window=widget, anchor="nw")
 
     def size_widget_to_figure() -> tuple[int, int]:
-        """Widget, canvas item and scroll region all take the figure's size.
+        """Widget, canvas item and scroll region all follow the figure's size.
 
         Deriving the scroll region from ``bbox("all")`` after an idle update
         lagged the figure by one redraw, so the lower panels sat outside the
-        scrollable area and could not be reached.
+        scrollable area; and the computed size alone was not enough after a
+        zoom, because Tk lays the widget out on its own schedule. Take the
+        largest of what was asked for and what Tk actually gave, once the
+        pending geometry has been processed.
         """
         width, height = (int(round(v * fig.dpi)) for v in fig.get_size_inches())
         widget.configure(width=width, height=height)
         viewport.itemconfigure(window_id, width=width, height=height)
+        widget.update_idletasks()
+        viewport.update_idletasks()
+        width = max(width, widget.winfo_reqwidth(), widget.winfo_width())
+        height = max(height, widget.winfo_reqheight(), widget.winfo_height())
         viewport.configure(scrollregion=(0, 0, width, height))
         return width, height
 
@@ -615,7 +619,6 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
 
     def rescroll() -> None:
         size_widget_to_figure()
-        widget.update_idletasks()
 
     def repaint() -> None:
         """Draw what is already parsed. No I/O, so this is safe on the UI thread.
@@ -644,15 +647,8 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
         fig.set_size_inches(width_px / fig.dpi, fig.get_size_inches()[1])
         repaint()
 
-    def on_fit_page() -> None:
-        """All six panels at once: fit the figure to the whole viewport."""
-        width_px = max(viewport.winfo_width(), 320)
-        height_px = max(viewport.winfo_height(), 240)
-        fig.set_size_inches(width_px / fig.dpi, height_px / fig.dpi)
-        repaint()
-
     widgets = build_controls(controls, palette, view, repaint,
-                             lambda: start_fetch(True), on_zoom, on_fit, on_fit_page)
+                             lambda: start_fetch(True), on_zoom, on_fit)
     status = widgets["status"]
 
     toolbar_frame = tk.Frame(root, bg=palette["figure"])
