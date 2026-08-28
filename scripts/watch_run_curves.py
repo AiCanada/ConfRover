@@ -6,10 +6,14 @@
 """Live loss curves for a running (or finished) `confrover train` job.
 
 Reads the run's ``logs/console.log`` -- locally, or straight off the rented box
-over ssh -- and redraws every ``--interval`` seconds as six panels on one page:
-the 10-step train heartbeats (total, forward, iid) across the top and the
-matching validation series beneath, on a shared x axis. One quantity per panel,
-so nothing hides behind anything else and each gets its own y range.
+over ssh -- and redraws every ``--interval`` seconds as six panels stacked in
+one column on a shared x axis: the 10-step train heartbeats (total, forward,
+iid), then the matching validation series. One quantity per panel, so nothing
+hides behind anything else, each gets its own y range, and the same x position
+is the same point of training in all six. Six panels are taller than a screen,
+so the live window is a scrolling canvas (wheel scrolls; ``--no_scroll`` for the
+plain matplotlib window). ``--theme carbon`` (the default) paints a woven
+graphite skin behind dark panels; ``--theme light`` is the plain one.
 
     # the cloud run, over ssh, refreshing every minute
     py -3.13 scripts/watch_run_curves.py --host 170.64.254.80 --port 27032 ^
@@ -186,23 +190,108 @@ def rolling(values: list[float | None], window: int) -> list[float | None]:
     return out
 
 
-#: How runs are told apart. Each panel holds one series, so colour is free to
-#: mean the run; thickness and marker repeat that so the figure survives
-#: greyscale printing and colour-blind readers.
+#: How runs are told apart: colour, and -- for a greyscale or colour-blind
+#: reader -- thickness and marker as well. Each panel holds one series, named in
+#: its title, so colour is free to mean the run. The first entry is the live
+#: run (the one --log / --host names, or the first --run): green and thickest,
+#: so it reads as the subject and the rest as background.
 RUN_STYLES = [
-    {"color": "tab:blue", "linewidth": 2.4, "marker": "o"},
-    {"color": "tab:red", "linewidth": 1.7, "marker": "s"},
-    {"color": "tab:green", "linewidth": 1.2, "marker": "^"},
-    {"color": "tab:purple", "linewidth": 0.9, "marker": "D"},
-    {"color": "tab:brown", "linewidth": 0.9, "marker": "v"},
-    {"color": "tab:olive", "linewidth": 0.9, "marker": "P"},
+    {"color": "#3ddc84", "linewidth": 2.4, "marker": "o"},
+    {"color": "#4dc3ff", "linewidth": 1.7, "marker": "s"},
+    {"color": "#ff6b5e", "linewidth": 1.2, "marker": "^"},
+    {"color": "#d2a8ff", "linewidth": 0.9, "marker": "D"},
+    {"color": "#ffd479", "linewidth": 0.9, "marker": "v"},
+    {"color": "#79ffe1", "linewidth": 0.9, "marker": "P"},
 ]
-#: (train key, val key, panel name); one column of the grid each.
+#: (train key, val key, panel name); one panel each, in this order.
 SERIES = (
     ("train_loss", "val_loss", "total"),
     ("train_fwd", "val_fwd", "forward"),
     ("train_iid", "val_iid", "iid"),
 )
+#: Panels of the stacked layout, top to bottom.
+PANELS = [(kind, keys) for kind in ("train", "val") for keys in SERIES]
+
+CARBON = {
+    "figure": "#0b0b0d",
+    "axes": "#141418",
+    "text": "#e8e8ea",
+    "muted": "#9aa0a6",
+    "grid": "#2f3138",
+    "spine": "#4a4d55",
+}
+LIGHT = {
+    "figure": "white",
+    "axes": "white",
+    "text": "black",
+    "muted": "0.35",
+    "grid": "0.85",
+    "spine": "0.4",
+}
+LIGHT_RUN_COLORS = ["tab:green", "tab:blue", "tab:red", "tab:purple", "tab:brown", "tab:olive"]
+
+
+def carbon_texture(width: int, height: int, tile: int = 16):
+    """A carbon-fibre weave as an (H, W, 3) float array.
+
+    Procedural rather than an asset: a twill of ``tile``-pixel blocks whose
+    diagonal flips like a checkerboard, with a per-block sheen. Drawn behind
+    everything with ``figimage``, so it costs one array per redraw and nothing
+    at plot time.
+    """
+    import numpy as np
+
+    half = max(2, tile // 2)
+    y, x = np.mgrid[0:tile, 0:tile]
+    block = ((x // half) + (y // half)) % 2 == 0
+    diagonal = np.where(block, x + y, x - y)
+    weave = 0.5 + 0.5 * np.sin(2 * np.pi * diagonal / half)
+    sheen = 0.5 + 0.5 * np.cos(2 * np.pi * ((y % half) / half))
+    value = 0.055 + 0.075 * weave + 0.03 * sheen  # near-black with a graphite lift
+    tiles_y = int(np.ceil(height / tile))
+    tiles_x = int(np.ceil(width / tile))
+    field = np.tile(value, (tiles_y, tiles_x))[:height, :width]
+    rgb = np.repeat(field[:, :, None], 3, axis=2)
+    rgb[:, :, 2] *= 1.10  # a cool cast, as woven carbon has
+    return np.clip(rgb, 0.0, 1.0)
+
+
+#: Label of the axes the weave is painted on, so a redraw reuses it. figimage
+#: was the obvious way and the wrong one: it places device pixels, so a texture
+#: built at the figure's dpi covered two thirds of a canvas saved at dpi=150,
+#: and every refresh stacked another copy.
+_BACKGROUND_LABEL = "carbon-weave"
+
+
+def apply_theme(fig, axes, theme: str) -> dict:
+    """Paint the figure. Returns the palette the drawing code should use."""
+    palette = CARBON if theme == "carbon" else LIGHT
+    fig.patch.set_facecolor(palette["figure"])
+    for existing in [ax for ax in fig.axes if ax.get_label() == _BACKGROUND_LABEL]:
+        existing.remove()
+    if theme == "carbon":
+        inches = fig.get_size_inches()
+        texture = carbon_texture(int(inches[0] * 90), int(inches[1] * 90))
+        background = fig.add_axes((0, 0, 1, 1), label=_BACKGROUND_LABEL, zorder=-100)
+        background.set_axis_off()
+        background.imshow(texture, extent=(0, 1, 0, 1), aspect="auto",
+                          interpolation="bilinear")
+    for ax in axes:
+        ax.set_facecolor(palette["axes"])
+        if theme == "carbon":
+            ax.patch.set_alpha(0.82)
+        ax.tick_params(colors=palette["muted"], labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(palette["spine"])
+        ax.xaxis.label.set_color(palette["text"])
+        ax.yaxis.label.set_color(palette["text"])
+    return palette
+
+
+def run_color(index: int, theme: str) -> str:
+    if theme == "carbon":
+        return RUN_STYLES[index % len(RUN_STYLES)]["color"]
+    return LIGHT_RUN_COLORS[index % len(LIGHT_RUN_COLORS)]
 
 
 def parse_run_spec(spec: str) -> tuple[str, "LogSource"]:
@@ -261,20 +350,21 @@ def write_csv(path: Path, runs: list[dict]) -> None:
                                  "batches": row["step"] * accum, **row})
 
 
-def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
-    """Six panels: train total/forward/iid over the matching validation panels.
+def draw(axes, runs: list[dict], smooth: int | None, x_axis: str, theme: str) -> None:
+    """Six panels stacked on one x axis: train total/forward/iid, then val.
 
-    One quantity per panel, so a series is never hidden behind another and each
-    gets its own y range (iid sits well above forward, and the train and val
-    scales differ). With one series per panel, colour identifies the *run*;
-    thickness and marker say the same thing again for a greyscale reader.
+    One quantity per panel, so nothing hides behind anything else and each gets
+    its own y range; the panels line up vertically, so the same x position is
+    the same point of training in all six.
     """
-    for ax in axes.flat:
+    for ax in axes:
         ax.clear()
+    palette = CARBON if theme == "carbon" else LIGHT
     solo = len(runs) == 1
 
     for index, run in enumerate(runs):
         style = RUN_STYLES[index % len(RUN_STYLES)]
+        colour = run_color(index, theme)
         scale = run["accum"] if x_axis == "batches" else 1
         train, vals = run["train"], run["vals"]
         window = smoothing_window(len(train), smooth)
@@ -283,42 +373,42 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
         steps = [r["step"] * scale for r in train]
         vsteps = [r["step"] * scale for r in vals]
 
-        colour = style["color"]
-        for column, (train_key, val_key, _name) in enumerate(SERIES):
-            ax_train, ax_val = axes[0][column], axes[1][column]
-
-            pts = [(s, r.get(train_key)) for s, r in zip(steps, train)
-                   if r.get(train_key) is not None]
-            if pts:
+        for panel, (kind, (train_key, val_key, _name)) in enumerate(PANELS):
+            ax = axes[panel]
+            if kind == "train":
+                pts = [(s, r.get(train_key)) for s, r in zip(steps, train)
+                       if r.get(train_key) is not None]
+                if not pts:
+                    continue
                 xs, ys = zip(*pts)
                 if solo:  # the raw heartbeats only when they are not several deep
-                    ax_train.plot(xs, ys, color=colour, alpha=0.18, linewidth=0.8)
-                ax_train.plot(xs, rolling(list(ys), window), color=colour,
-                              linewidth=style["linewidth"], marker=style["marker"],
-                              markevery=every, markersize=4)
-
-            pts = [(s, r.get(val_key)) for s, r in zip(vsteps, vals)
-                   if r.get(val_key) is not None]
-            if pts:
+                    ax.plot(xs, ys, color=colour, alpha=0.16, linewidth=0.8)
+                ax.plot(xs, rolling(list(ys), window), color=colour,
+                        linewidth=style["linewidth"], marker=style["marker"],
+                        markevery=every, markersize=4)
+            else:
+                pts = [(s, r.get(val_key)) for s, r in zip(vsteps, vals)
+                       if r.get(val_key) is not None]
+                if not pts:
+                    continue
                 xs, ys = zip(*pts)
-                ax_val.plot(xs, ys, color=colour, linewidth=style["linewidth"],
-                            marker=style["marker"], markersize=4,
-                            markevery=max(1, len(xs) // 25))
-                if index == 0:
-                    best = min(range(len(ys)), key=lambda i: ys[i])
-                    ax_val.annotate(f"best {ys[best]:.4f}", (xs[best], ys[best]),
-                                    textcoords="offset points", xytext=(5, -11),
-                                    fontsize=7.5, color=colour)
+                ax.plot(xs, ys, color=colour, linewidth=style["linewidth"],
+                        marker=style["marker"], markersize=4,
+                        markevery=max(1, len(xs) // 25))
+                best = min(range(len(ys)), key=lambda i: ys[i])
+                ax.annotate(f"{run['label']} best {ys[best]:.4f}", (xs[best], ys[best]),
+                            textcoords="offset points", xytext=(6, -11),
+                            fontsize=7.5, color=colour)
 
-    for column, (_train_key, _val_key, name) in enumerate(SERIES):
-        axes[0][column].set_title(f"train {name}", fontsize=11)
-        axes[1][column].set_title(f"val {name}", fontsize=11)
-        for row in (0, 1):
-            axes[row][column].grid(alpha=0.25)
-        axes[1][column].set_xlabel("training samples (steps x accumulation)"
-                                   if x_axis == "batches" else "optimizer step")
-    axes[0][0].set_ylabel(f"train loss (rolling mean)")
-    axes[1][0].set_ylabel("val loss (fixed bag, t grid)")
+    for panel, (kind, (_train_key, _val_key, name)) in enumerate(PANELS):
+        ax = axes[panel]
+        ax.set_title(f"{kind} {name}", fontsize=10, color=palette["text"], loc="left")
+        ax.grid(alpha=0.35, color=palette["grid"], linewidth=0.6)
+        ax.set_ylabel("rolling mean" if kind == "train" else "fixed bag, t grid",
+                      fontsize=8, color=palette["muted"])
+    axes[-1].set_xlabel("training samples (steps x accumulation)"
+                        if x_axis == "batches" else "optimizer step",
+                        color=palette["text"])
 
     from matplotlib.lines import Line2D
 
@@ -333,10 +423,72 @@ def draw(axes, runs: list[dict], smooth: int | None, x_axis: str) -> None:
         if best is not None:
             label += f"  best val_fwd {best:.4f}"
         label += f"  [mean {run.get('smooth', '?')}]"
-        handles.append(Line2D([], [], color=style["color"], linewidth=style["linewidth"],
-                              marker=style["marker"], markersize=4, label=label))
-    axes[0][0].legend(handles=handles, loc="upper right", fontsize=7.5,
-                      title="run" if not solo else None, framealpha=0.9)
+        handles.append(Line2D([], [], color=run_color(i, theme),
+                              linewidth=style["linewidth"], marker=style["marker"],
+                              markersize=4, label=label))
+    legend = axes[0].legend(handles=handles, loc="upper right", fontsize=7.5,
+                            title="run", framealpha=0.85,
+                            facecolor=palette["axes"], edgecolor=palette["spine"],
+                            labelcolor=palette["text"])
+    if legend.get_title() is not None:
+        legend.get_title().set_color(palette["text"])
+
+
+def show_scrollable(fig, interval: float, refresh, theme: str) -> int:
+    """The figure in a window with scroll bars, redrawn every ``interval`` s.
+
+    Six stacked panels are taller than a screen, and a matplotlib window only
+    squashes them. A Tk canvas holding the figure at its natural size scrolls
+    instead, with the wheel bound to the vertical bar. Falls back to the plain
+    matplotlib window if Tk is unavailable.
+    """
+    import tkinter as tk
+
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    palette = CARBON if theme == "carbon" else LIGHT
+    root = tk.Tk()
+    root.title("ConfRover training")
+    root.configure(bg=palette["figure"])
+    frame = tk.Frame(root, bg=palette["figure"])
+    frame.pack(fill=tk.BOTH, expand=True)
+    viewport = tk.Canvas(frame, bg=palette["figure"], highlightthickness=0)
+    vbar = tk.Scrollbar(frame, orient=tk.VERTICAL, command=viewport.yview)
+    hbar = tk.Scrollbar(frame, orient=tk.HORIZONTAL, command=viewport.xview)
+    viewport.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    vbar.pack(side=tk.RIGHT, fill=tk.Y)
+    hbar.pack(side=tk.BOTTOM, fill=tk.X)
+    viewport.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    canvas = FigureCanvasTkAgg(fig, master=viewport)
+    widget = canvas.get_tk_widget()
+    widget.configure(bg=palette["figure"], highlightthickness=0)
+    viewport.create_window((0, 0), window=widget, anchor="nw")
+
+    def rescroll() -> None:
+        widget.update_idletasks()
+        viewport.configure(scrollregion=viewport.bbox("all"))
+
+    def on_wheel(event) -> None:
+        delta = -1 if getattr(event, "delta", 0) > 0 or event.num == 4 else 1
+        viewport.yview_scroll(delta, "units")
+
+    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        root.bind_all(sequence, on_wheel)
+    root.geometry("1280x900")
+
+    def tick() -> None:
+        try:
+            refresh()
+        except Exception as exc:  # a transient ssh failure must not end the watch
+            print(f"refresh failed, retrying in {interval:.0f}s: {exc}", file=sys.stderr)
+        canvas.draw_idle()
+        rescroll()
+        root.after(int(max(interval, 1.0) * 1000), tick)
+
+    tick()
+    root.mainloop()
+    return 0
 
 
 def main() -> int:
@@ -362,6 +514,13 @@ def main() -> int:
     parser.add_argument("--x", dest="x_axis", choices=("batches", "step"), default="batches",
                         help="x axis: training samples (default, comparable across "
                              "accumulation settings) or raw optimizer steps.")
+    parser.add_argument("--theme", choices=("carbon", "light"), default="carbon",
+                        help="carbon: woven graphite skin, dark panels (default).")
+    parser.add_argument("--panel_height", type=float, default=2.6,
+                        help="Inches per panel; six of them stack, so the window scrolls.")
+    parser.add_argument("--width", type=float, default=12.0, help="Figure width in inches.")
+    parser.add_argument("--no_scroll", action="store_true",
+                        help="Plain matplotlib window instead of the scrollable one.")
     parser.add_argument("--once", action="store_true", help="Render once and exit (no window).")
     parser.add_argument("--out", type=Path, help="Also save the figure here (PNG).")
     parser.add_argument("--csv", type=Path, help="Write the parsed series as CSV.")
@@ -393,12 +552,12 @@ def main() -> int:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=True, squeeze=False)
-    if not args.once:
-        try:
-            fig.canvas.manager.set_window_title("ConfRover training")
-        except AttributeError:
-            pass
+    fig, axes = plt.subplots(
+        len(PANELS), 1, figsize=(args.width, args.panel_height * len(PANELS)),
+        sharex=True,
+    )
+    axes = list(axes)
+    palette = apply_theme(fig, axes, args.theme)
 
     def refresh() -> list[dict]:
         runs: list[dict] = []
@@ -418,13 +577,14 @@ def main() -> int:
                  + (f"  +{len(runs) - 1} earlier run(s) overlaid" if len(runs) > 1 else "")
                  + "\nloss is comparable only between runs with the same "
                    "--window_frames and task mix")
-        draw(axes, runs, args.smooth, args.x_axis)
-        fig.suptitle(title, fontsize=9)
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        draw(axes, runs, args.smooth, args.x_axis, args.theme)
+        apply_theme(fig, axes, args.theme)
+        fig.suptitle(title, fontsize=9, color=palette["text"])
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
         if args.csv:
             write_csv(args.csv, runs)
         if args.out:
-            fig.savefig(args.out, dpi=150)
+            fig.savefig(args.out, dpi=150, facecolor=fig.get_facecolor())
         return runs
 
     if args.once:
@@ -436,13 +596,20 @@ def main() -> int:
             print(f"-> {args.out}")
         return 0
 
+    if not args.no_scroll:
+        try:
+            return show_scrollable(fig, args.interval, refresh, args.theme)
+        except Exception as exc:  # no Tk, no display: fall back rather than fail
+            print(f"scrollable window unavailable ({exc}); plain window instead",
+                  file=sys.stderr)
+
     plt.ion()
     plt.show(block=False)
     try:
         while True:
             try:
                 refresh()
-            except Exception as exc:  # a transient ssh failure must not end the watch
+            except Exception as exc:
                 print(f"refresh failed, retrying in {args.interval:.0f}s: {exc}", file=sys.stderr)
             fig.canvas.draw_idle()
             plt.pause(max(args.interval, 1.0))
