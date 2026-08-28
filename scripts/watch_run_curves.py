@@ -15,14 +15,16 @@ so the live window is a scrolling canvas (wheel scrolls; ``--no_scroll`` for the
 plain matplotlib window). ``--theme carbon`` (the default) paints a woven
 graphite skin behind dark panels; ``--theme light`` is the plain one.
 
-The bar above the figure changes the view without restarting the watch or
-re-reading anything: the x axis between training samples (steps x accumulation,
-comparable across runs) and raw optimizer steps; "focus live run", which limits
-the x range to the newest run so a 900-step run is not a sliver beside a
-37,000-step one; zoom, which resizes the figure inside the scrolling canvas;
-and "fit width". The matplotlib toolbar along the bottom adds pan, rectangle
-zoom and home. ``--x``, ``--yscale``, ``--smooth`` and ``--focus_live`` set
+The x axis is the optimizer step for every run. The bar above the figure
+changes the view without restarting the watch or re-reading anything: "live run
+only", which drops the overlaid runs so a 1,000-step run is not a sliver beside
+a 37,000-step one; zoom, which resizes the figure inside the scrolling canvas;
+"fit width"; and "fit all 6". The matplotlib toolbar along the bottom adds pan,
+rectangle zoom and home. ``--yscale``, ``--smooth`` and ``--live_only`` set
 where it starts.
+
+Under each panel is the step count behind it, per run: how many heartbeats or
+validations that panel is drawn from, and the last step reached.
 
 Reading the logs happens on a worker thread: an ssh read takes seconds, and
 doing it in a Tk callback froze the window for the whole round trip.
@@ -48,10 +50,8 @@ doing it in a Tk callback froze the window for the whole round trip.
 Each panel holds one series, so colour identifies the run -- with thickness and
 marker repeating it for a greyscale or colour-blind reader. The run legend on
 the first panel carries each run's accumulation factor, best val_forward and
-smoothing window. The x axis is training samples
-(optimizer steps x the accumulation factor, inferred per run from its own
-``samples=`` counter), so a run with --accumulate_grad_batches 4 lines up with
-one without it.
+smoothing window, and its accumulation factor where it is not 1 (that run sees
+that many batches per optimizer step, so equal steps are not equal data).
 
 Train heartbeats are noisy by construction: one step is a single protein at a
 single diffusion time, and the mix of iid and forward windows changes step to
@@ -74,6 +74,9 @@ from pathlib import Path, PurePosixPath
 STEP_RE = re.compile(r"\[step (\d+)\]")
 SAMPLES_RE = re.compile(r"samples=(\d+)")
 TRAIN_FIELDS = {
+    # the schedule's own record: warm-up, peak and the cosine tail, as the run
+    # actually applied them rather than as the flags asked for them
+    "lr": re.compile(r"lr=([0-9.eE+-]+)"),
     "train_loss": re.compile(r"train_loss\(mean over \d+\)=([0-9.]+)"),
     "train_fwd": re.compile(r"train_fwd_loss=([0-9.]+)"),
     "train_iid": re.compile(r"train_iid_loss=([0-9.]+)"),
@@ -221,8 +224,10 @@ SERIES = (
     ("train_fwd", "val_fwd", "forward"),
     ("train_iid", "val_iid", "iid"),
 )
-#: Panels of the stacked layout, top to bottom.
-PANELS = [(kind, keys) for kind in ("train", "val") for keys in SERIES]
+#: Panels of the stacked layout, top to bottom: the three train series, the
+#: three validation series, then the learning rate the run actually applied.
+PANELS = ([(kind, keys) for kind in ("train", "val") for keys in SERIES]
+          + [("lr", ("lr", None, "learning rate"))])
 
 CARBON = {
     "figure": "#0b0b0d",
@@ -374,19 +379,22 @@ def draw(axes, runs: list[dict], view: dict, theme: str) -> None:
     for ax in axes:
         ax.clear()
     palette = CARBON if theme == "carbon" else LIGHT
+    if view.get("live_only"):
+        # Not a zoom: the overlaid runs leave the figure, so the live run owns
+        # every axis and its own range.
+        runs = runs[:1]
     solo = len(runs) == 1
-    smooth, x_axis = view["smooth"], view["x_axis"]
+    smooth = view["smooth"]
 
     for index, run in enumerate(runs):
         style = RUN_STYLES[index % len(RUN_STYLES)]
         colour = run_color(index, theme)
-        scale = run["accum"] if x_axis == "batches" else 1
         train, vals = run["train"], run["vals"]
         window = smoothing_window(len(train), smooth)
         run["smooth"] = window
         every = max(1, len(train) // 12)
-        steps = [r["step"] * scale for r in train]
-        vsteps = [r["step"] * scale for r in vals]
+        steps = [r["step"] for r in train]
+        vsteps = [r["step"] for r in vals]
 
         for panel, (kind, (train_key, val_key, _name)) in enumerate(PANELS):
             ax = axes[panel]
@@ -401,6 +409,14 @@ def draw(axes, runs: list[dict], view: dict, theme: str) -> None:
                 ax.plot(xs, rolling(list(ys), window), color=colour,
                         linewidth=style["linewidth"], marker=style["marker"],
                         markevery=every, markersize=4)
+            elif kind == "lr":
+                pts = [(s, r.get("lr")) for s, r in zip(steps, train)
+                       if r.get("lr") is not None]
+                if not pts:
+                    continue
+                xs, ys = zip(*pts)
+                ax.plot(xs, ys, color=colour, linewidth=style["linewidth"],
+                        marker=style["marker"], markevery=every, markersize=4)
             else:
                 pts = [(s, r.get(val_key)) for s, r in zip(vsteps, vals)
                        if r.get(val_key) is not None]
@@ -415,27 +431,34 @@ def draw(axes, runs: list[dict], view: dict, theme: str) -> None:
                             textcoords="offset points", xytext=(6, -11),
                             fontsize=7.5, color=colour)
 
-    for panel, (kind, (_train_key, _val_key, name)) in enumerate(PANELS):
+    for panel, (kind, (train_key, val_key, name)) in enumerate(PANELS):
         ax = axes[panel]
-        ax.set_title(f"{kind} {name}", fontsize=10, color=palette["text"], loc="left")
+        ax.set_title(name if kind == "lr" else f"{kind} {name}", fontsize=10,
+                     color=palette["text"], loc="left")
         ax.grid(alpha=0.35, color=palette["grid"], linewidth=0.6)
-        ax.set_ylabel("rolling mean" if kind == "train" else "fixed bag, t grid",
-                      fontsize=8, color=palette["muted"])
-    for ax in axes:
-        ax.set_yscale(view["yscale"])
-    if view.get("focus_live") and runs:
-        # A 900-step run next to a 37,000-step one is a sliver at the origin;
-        # focusing means the newest run fills the width and the older ones are
-        # read where they overlap it.
-        live = runs[0]
-        scale = live["accum"] if x_axis == "batches" else 1
-        last = max((r["step"] for r in live["train"]), default=0) * scale
-        if last > 0:
-            for ax in axes:
-                ax.set_xlim(0, last * 1.02)
-    axes[-1].set_xlabel("training samples (steps x accumulation)"
-                        if x_axis == "batches" else "optimizer step",
-                        color=palette["text"])
+        ax.set_ylabel({"train": "rolling mean", "val": "fixed bag, t grid",
+                       "lr": "as applied"}[kind], fontsize=8, color=palette["muted"])
+        if kind == "lr":
+            ax.set_yscale("log")  # warm-up to floor is two orders of magnitude
+        # What this panel is actually drawn from: a run with no iid batch in a
+        # window contributes no iid point, so the counts differ panel to panel.
+        key = val_key if kind == "val" else train_key
+        rows = "vals" if kind == "val" else "train"
+        counts = []
+        for run in runs:
+            points = [r for r in run[rows] if r.get(key) is not None]
+            if not points:
+                continue
+            counts.append(f"{run['label']}: {len(points)} pts to step {points[-1]['step']:,}")
+        if counts:
+            ax.set_xlabel("   |   ".join(counts), fontsize=7.5,
+                          color=palette["muted"], loc="left")
+    for ax, (kind, _keys) in zip(axes, PANELS):
+        if kind != "lr":  # the schedule spans decades; it stays logarithmic
+            ax.set_yscale(view["yscale"])
+    # The axis name goes under the counts of the bottom panel.
+    axes[-1].set_xlabel(axes[-1].get_xlabel() + "\noptimizer step",
+                        fontsize=7.5, color=palette["muted"], loc="left")
 
     from matplotlib.lines import Line2D
 
@@ -463,7 +486,7 @@ def draw(axes, runs: list[dict], view: dict, theme: str) -> None:
 
 def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
                    on_zoom=None, on_fit=None, on_fit_page=None) -> dict:
-    """The bar above the figure: the x axis, the zoom, and where to look.
+    """The bar above the figure: what is shown, and how large.
 
     The handlers must never touch the network: they write into ``view`` -- the
     same dict :func:`draw` reads -- and repaint the data already in hand. Doing
@@ -472,27 +495,18 @@ def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
     """
     import tkinter as tk
 
-    x_var = tk.StringVar(value=view["x_axis"])
-    focus_var = tk.BooleanVar(value=bool(view.get("focus_live")))
+    live_var = tk.BooleanVar(value=bool(view.get("live_only")))
 
-    def on_x() -> None:
-        view["x_axis"] = x_var.get()
-        on_change()
-
-    def on_focus() -> None:
-        view["focus_live"] = bool(focus_var.get())
+    def on_live_only() -> None:
+        view["live_only"] = bool(live_var.get())
         on_change()
 
     label_kw = {"bg": palette["figure"], "fg": palette["muted"]}
     radio_kw = {"bg": palette["figure"], "fg": palette["text"],
                 "selectcolor": palette["axes"], "activebackground": palette["figure"],
                 "activeforeground": palette["text"], "highlightthickness": 0}
-    tk.Label(parent, text="x axis:", **label_kw).pack(side=tk.LEFT, padx=(10, 2))
-    for text, value in (("training samples", "batches"), ("optimizer steps", "step")):
-        tk.Radiobutton(parent, text=text, variable=x_var, value=value,
-                       command=on_x, **radio_kw).pack(side=tk.LEFT)
-    tk.Checkbutton(parent, text="focus live run", variable=focus_var, command=on_focus,
-                   **radio_kw).pack(side=tk.LEFT, padx=(14, 2))
+    tk.Checkbutton(parent, text="live run only", variable=live_var, command=on_live_only,
+                   **radio_kw).pack(side=tk.LEFT, padx=(10, 2))
     button_kw = {"bg": palette["axes"], "fg": palette["text"],
                  "activebackground": palette["spine"], "activeforeground": palette["text"],
                  "highlightthickness": 0, "relief": "flat", "width": 3}
@@ -512,8 +526,7 @@ def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
               fg=palette["text"], activebackground=palette["spine"],
               activeforeground=palette["text"], highlightthickness=0,
               relief="flat").pack(side=tk.RIGHT, padx=10)
-    return {"x": x_var, "on_x": on_x, "focus": focus_var, "on_focus": on_focus,
-            "status": status}
+    return {"live_only": live_var, "on_live_only": on_live_only, "status": status}
 
 
 def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict) -> int:
@@ -689,10 +702,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smooth", type=int, default=None,
                         help="Rolling-mean window in heartbeats; default scales "
                              "with each run's length (10-200).")
-    parser.add_argument("--x", dest="x_axis", choices=("batches", "step"), default="batches",
-                        help="Initial x axis: training samples (default, comparable "
-                             "across accumulation settings) or raw optimizer steps. "
-                             "The window switches between them.")
     parser.add_argument("--yscale", choices=("linear", "log"), default="linear",
                         help="y scale. log spreads out a plateau, linear keeps the "
                              "differences in proportion.")
@@ -701,9 +710,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--panel_height", type=float, default=2.6,
                         help="Inches per panel; six of them stack, so the window scrolls.")
     parser.add_argument("--width", type=float, default=12.0, help="Figure width in inches.")
-    parser.add_argument("--focus_live", action="store_true",
-                        help="Start with the x range limited to the live run, so a "
-                             "short new run is not squashed by a long finished one. "
+    parser.add_argument("--live_only", action="store_true",
+                        help="Draw only the live run (the first source), so a short "
+                             "new run is not a sliver beside a long finished one. "
                              "The window can toggle it.")
     parser.add_argument("--no_scroll", action="store_true",
                         help="Plain matplotlib window instead of the scrollable one.")
@@ -749,8 +758,8 @@ def main() -> int:
     axes = list(axes)
     palette = apply_theme(fig, axes, args.theme)
     #: What the window's controls change without restarting the watch.
-    view = {"x_axis": args.x_axis, "yscale": args.yscale, "smooth": args.smooth,
-            "focus_live": bool(args.focus_live)}
+    view = {"yscale": args.yscale, "smooth": args.smooth,
+            "live_only": bool(args.live_only)}
 
     def fetch() -> list[dict]:
         """Read and parse every source. Slow (ssh), so never on the UI thread."""
@@ -771,15 +780,10 @@ def main() -> int:
         """Draw parsed runs. No I/O: safe to call from a Tk callback."""
         live = runs[0]
         last = live["train"][-1]["step"] if live["train"] else 0
-        # Name the x mode: only the live run uses accumulation, so switching it
-        # moves that one line and leaves the axis range (set by a long accum-1
-        # run) alone -- which reads as "nothing happened" unless the title says.
-        mode = ("x: training samples (steps x accumulation)"
-                if view["x_axis"] == "batches" else "x: optimizer steps")
-        focus = "  |  focused on the live run" if view.get("focus_live") else ""
+        overlaid = 0 if view.get("live_only") else len(runs) - 1
         title = (f"{live['label']} @ step {last}"
-                 + (f"  +{len(runs) - 1} earlier run(s) overlaid" if len(runs) > 1 else "")
-                 + f"  |  {mode}{focus}"
+                 + (f"  +{overlaid} earlier run(s) overlaid" if overlaid else
+                    ("  |  live run only" if len(runs) > 1 else ""))
                  + "\nloss is comparable only between runs with the same "
                    "--window_frames and task mix")
         draw(axes, runs, view, args.theme)

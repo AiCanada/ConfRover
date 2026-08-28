@@ -154,104 +154,52 @@ def test_every_run_is_distinguishable_by_colour_and_again_without_it():
 # --- what the reader can change from the window ------------------------------
 
 
-def test_the_cli_offers_both_axes_and_both_scales():
+def test_the_cli_keeps_the_scale_and_the_live_only_switch():
     parser = watch.build_parser()
     args = parser.parse_args([])
-    assert args.x_axis == "batches" and args.yscale == "linear"
-    args = parser.parse_args(["--x", "step", "--yscale", "log"])
-    assert args.x_axis == "step" and args.yscale == "log"
+    assert args.yscale == "linear" and args.live_only is False
+    assert not hasattr(args, "x_axis"), "the x axis is always the optimizer step"
+    args = parser.parse_args(["--yscale", "log", "--live_only"])
+    assert args.yscale == "log" and args.live_only is True
     with pytest.raises(SystemExit):
         parser.parse_args(["--yscale", "sqrt"])
 
 
-def test_the_x_axis_control_repaints_without_reading_anything():
-    """Tk callbacks run on the thread that draws the window, so a control that
-    read the logs froze it for the whole ssh round trip -- which is what
-    happened. The handler may only write into the view and repaint."""
-    tk = pytest.importorskip("tkinter")
-    try:
-        root = tk.Tk()
-    except tk.TclError as exc:  # no display (CI)
-        pytest.skip(f"no Tk display: {exc}")
-    try:
-        root.withdraw()
-        view = {"x_axis": "batches", "yscale": "linear", "smooth": None}
-        repaints, fetches = [], []
-        controls = watch.build_controls(
-            tk.Frame(root), watch.CARBON, view,
-            lambda: repaints.append(1), lambda: fetches.append(1),
-        )
-        controls["x"].set("step")
-        controls["on_x"]()
-        assert view["x_axis"] == "step"
-        assert repaints == [1] and fetches == [], "the toggle must not fetch"
-
-        controls["x"].set("batches")
-        controls["on_x"]()
-        assert view["x_axis"] == "batches" and len(repaints) == 2
-    finally:
-        root.destroy()
-
-
-def test_focus_live_limits_the_x_range_to_the_newest_run():
-    """A 900-step run beside a 37,000-step one is a sliver at the origin. With
-    focus on, the newest run fills the width and the older ones are read where
-    they overlap it."""
+def test_live_only_drops_the_overlaid_runs():
+    """Not a zoom: the earlier runs leave the figure, so the live run owns every
+    axis and its own range."""
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     live = {"label": "live", "accum": 4, "smooth": 10,
             "train": [{"step": s, "train_loss": 0.5, "train_fwd": 0.4, "train_iid": 0.6}
-                      for s in (10, 200)],
-            "vals": [{"step": 125, "val_loss": 0.5, "val_fwd": 0.44, "val_iid": 0.6}]}
+                      for s in (10, 930)],
+            "vals": [{"step": 500, "val_loss": 0.5, "val_fwd": 0.44, "val_iid": 0.6}]}
     old = {"label": "old", "accum": 1, "smooth": 50,
            "train": [{"step": s, "train_loss": 0.5, "train_fwd": 0.4, "train_iid": 0.6}
-                     for s in (10, 36000)],
+                     for s in (10, 36940)],
            "vals": [{"step": 36000, "val_loss": 0.5, "val_fwd": 0.42, "val_iid": 0.6}]}
 
     fig, axes = plt.subplots(len(watch.PANELS), 1)
     axes = list(axes)
     try:
-        view = {"x_axis": "batches", "yscale": "linear", "smooth": 10, "focus_live": False}
-        watch.draw(axes, [live, old], view, "light")
-        assert axes[0].get_xlim()[1] > 30000, "unfocused, the long run sets the range"
+        watch.draw(axes, [live, old], {"yscale": "linear", "smooth": 10, "live_only": False},
+                   "light")
+        assert len(axes[0].lines) == 2 and axes[0].get_xlim()[1] > 30000
 
-        view["focus_live"] = True
-        watch.draw(axes, [live, old], view, "light")
-        # the live run ends at step 200 x accumulation 4 = 800 samples
-        assert 800 <= axes[0].get_xlim()[1] <= 900
-        assert axes[-1].get_xlim() == axes[0].get_xlim(), "every panel shares it"
+        watch.draw(axes, [live, old], {"yscale": "linear", "smooth": 10, "live_only": True},
+                   "light")
+        ends = [max(line.get_xdata()) for line in axes[0].lines]
+        assert ends and max(ends) == 930, "nothing from the 36,940-step run is drawn"
+        assert axes[0].get_xlim()[1] < 1100, "and the live run owns the range"
     finally:
         plt.close(fig)
 
 
-def test_the_window_offers_zoom_and_fit_but_only_when_wired():
-    tk = pytest.importorskip("tkinter")
-    try:
-        root = tk.Tk()
-    except tk.TclError as exc:
-        pytest.skip(f"no Tk display: {exc}")
-    try:
-        root.withdraw()
-        view = {"x_axis": "batches", "yscale": "linear", "smooth": None, "focus_live": False}
-        repaints, zooms, fits = [], [], []
-        controls = watch.build_controls(
-            tk.Frame(root), watch.CARBON, view,
-            lambda: repaints.append(1), lambda: None,
-            on_zoom=lambda factor: zooms.append(factor), on_fit=lambda: fits.append(1),
-        )
-        controls["focus"].set(True)
-        controls["on_focus"]()
-        assert view["focus_live"] is True and repaints == [1]
-    finally:
-        root.destroy()
-
-
-def test_switching_the_x_axis_rescales_a_run_that_accumulates():
-    """The toggle looked inert because only the live run uses accumulation, so
-    the axis range (set by a long accum-1 run) does not move -- only that one
-    line does. It is real: 930 optimizer steps are 3,720 training samples."""
+def test_the_x_axis_is_always_the_optimizer_step():
+    """Steps, never steps x accumulation: the accumulation factor stays in the
+    legend, where it says equal steps are not equal data."""
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -261,14 +209,82 @@ def test_switching_the_x_axis_rescales_a_run_that_accumulates():
     fig, axes = plt.subplots(len(watch.PANELS), 1)
     axes = list(axes)
     try:
-        ends = {}
-        for mode in ("batches", "step"):
-            watch.draw(axes, [live],
-                       {"x_axis": mode, "yscale": "linear", "smooth": 10, "focus_live": False},
-                       "light")
-            ends[mode] = axes[0].lines[-1].get_xdata()[-1]
-            assert axes[-1].get_xlabel().startswith(
-                "training samples" if mode == "batches" else "optimizer step")
-        assert ends["batches"] == 4 * ends["step"] == 3720
+        watch.draw(axes, [live], {"yscale": "linear", "smooth": 10, "live_only": False}, "light")
+        assert axes[0].lines[-1].get_xdata()[-1] == 930
+        assert "optimizer step" in axes[-1].get_xlabel()
+    finally:
+        plt.close(fig)
+
+
+def test_each_panel_names_the_points_behind_it():
+    """A window with no iid batch contributes no iid point, so the counts differ
+    panel to panel; the label under each says what it is drawn from."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    run = {"label": "live", "accum": 1, "smooth": 10,
+           "train": [{"step": 10, "train_loss": 0.5, "train_fwd": 0.4, "train_iid": 0.6},
+                     {"step": 20, "train_loss": 0.5, "train_fwd": 0.4}],  # no iid here
+           "vals": [{"step": 500, "val_loss": 0.5, "val_fwd": 0.44, "val_iid": 0.6}]}
+    fig, axes = plt.subplots(len(watch.PANELS), 1)
+    axes = list(axes)
+    try:
+        watch.draw(axes, [run], {"yscale": "linear", "smooth": 10, "live_only": False}, "light")
+        assert "live: 2 pts to step 20" in axes[0].get_xlabel()      # train total
+        assert "live: 1 pts to step 10" in axes[2].get_xlabel()      # train iid
+        assert "live: 1 pts to step 500" in axes[3].get_xlabel()     # val total
+        assert "optimizer step" in axes[-1].get_xlabel()             # and the axis name
+    finally:
+        plt.close(fig)
+
+
+def test_the_live_only_control_writes_into_the_view_without_reading_anything():
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # no display (CI)
+        pytest.skip(f"no Tk display: {exc}")
+    try:
+        root.withdraw()
+        view = {"yscale": "linear", "smooth": None, "live_only": False}
+        repaints, fetches, zooms, fits = [], [], [], []
+        controls = watch.build_controls(
+            tk.Frame(root), watch.CARBON, view,
+            lambda: repaints.append(1), lambda: fetches.append(1),
+            on_zoom=lambda factor: zooms.append(factor), on_fit=lambda: fits.append(1),
+        )
+        controls["live_only"].set(True)
+        controls["on_live_only"]()
+        assert view["live_only"] is True
+        assert repaints == [1] and fetches == [], "a toggle must not fetch"
+    finally:
+        root.destroy()
+
+
+def test_the_seventh_panel_is_the_learning_rate_the_run_applied():
+    """Logged per heartbeat as lr=..., so the panel shows warm-up, peak and the
+    cosine tail as they were applied -- not as the flags asked for them."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    train, _ = watch.parse_console(CONSOLE)
+    assert train[0]["lr"] == pytest.approx(6.06e-06), "parsed from the heartbeat"
+
+    assert len(watch.PANELS) == 7
+    assert watch.PANELS[-1][0] == "lr"
+
+    run = {"label": "live", "accum": 1, "smooth": 10,
+           "train": [{"step": 10, "lr": 6.06e-06}, {"step": 500, "lr": 3.0e-05}],
+           "vals": []}
+    fig, axes = plt.subplots(len(watch.PANELS), 1)
+    axes = list(axes)
+    try:
+        watch.draw(axes, [run], {"yscale": "linear", "smooth": 10, "live_only": False}, "light")
+        lr_axis = axes[-1]
+        assert lr_axis.get_yscale() == "log", "warm-up to floor spans decades"
+        assert list(lr_axis.lines[-1].get_ydata()) == [6.06e-06, 3.0e-05]
+        assert lr_axis.get_title(loc="left") == "learning rate"
     finally:
         plt.close(fig)
