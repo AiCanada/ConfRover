@@ -112,7 +112,6 @@ class ConfRoverTrain(ConfRover):
         lr_schedule: LRScheduleName = DEFAULT_LR_SCHEDULE,
         lr_warmup_steps: int = DEFAULT_LR_WARMUP_STEPS,
         lr_min_ratio: float = DEFAULT_LR_MIN_RATIO,
-        context_dropout: float = 0.0,
         **kwargs,
     ):
         super().__init__(
@@ -135,20 +134,6 @@ class ConfRoverTrain(ConfRover):
         self.lr_schedule = lr_schedule
         self.lr_warmup_steps = int(lr_warmup_steps)
         self.lr_min_ratio = float(lr_min_ratio)
-        # Classifier-free guidance, transplanted to trajectory conditioning:
-        # with probability p a forward example's context frames are replaced by
-        # the BEGIN mask token, so one set of weights learns both the
-        # conditional score (given the past frames) and the unconditional one.
-        # Sampling can then extrapolate between them -- "follow the context
-        # this much" -- and the iid task stops competing with forward for the
-        # same capacity, because the dropped forward examples *are* the iid
-        # objective at the window's frame layout. Training only; validation
-        # always sees the real context so the curve stays comparable.
-        self.context_dropout = float(context_dropout)
-        if not 0.0 <= self.context_dropout < 1.0:
-            raise ValueError(
-                f"context_dropout must be in [0, 1), got {context_dropout}"
-            )
 
     @classmethod
     def from_base_checkpoint(
@@ -167,7 +152,6 @@ class ConfRoverTrain(ConfRover):
         lr_schedule: LRScheduleName = DEFAULT_LR_SCHEDULE,
         lr_warmup_steps: int = DEFAULT_LR_WARMUP_STEPS,
         lr_min_ratio: float = DEFAULT_LR_MIN_RATIO,
-        context_dropout: float = 0.0,
     ) -> "ConfRoverTrain":
         assert_base_weight_family(pretrained_model)
         from pathlib import Path
@@ -218,7 +202,6 @@ class ConfRoverTrain(ConfRover):
             lr_schedule=lr_schedule,
             lr_warmup_steps=lr_warmup_steps,
             lr_min_ratio=lr_min_ratio,
-            context_dropout=context_dropout,
         )
         model.export_model_cfg = model_ckpt["model_cfg"]
         model.decoder.loss = loss if loss is not None else ConfDiffLoss()
@@ -657,9 +640,6 @@ class ConfRoverTrain(ConfRover):
         )
         aux_info = dict(aux_info)
         aux_info["frames_per_step"] = float(num_frames)
-        dropped = self.__dict__.pop("_context_dropped", None)
-        if dropped is not None:
-            aux_info["context_dropped"] = dropped
         return {"loss": loss, "aux_info": aux_info}
 
     def _sample_t(
@@ -776,18 +756,6 @@ class ConfRoverTrain(ConfRover):
         tokens_per_example = n_fused // batch_size
         return frame_pos.repeat_interleave(tokens_per_example, dim=0)
 
-    def _context_dropout_mask(self, batch_size: int, device):
-        """Which examples in this batch train the unconditional score, or None.
-
-        Training only, and only when ``--context_dropout`` is on: validation
-        must see the real context or its loss stops being comparable with runs
-        that do not use dropout.
-        """
-        p = getattr(self, "context_dropout", 0.0)
-        if not self.training or p <= 0.0:
-            return None
-        return torch.rand(batch_size, device=device) < p
-
     def _encode_context(self, batch, aatype, padding_mask):
         batch_size, seqlen = aatype.shape[:2]
         dtype = self.mask_token_rigids.dtype
@@ -812,29 +780,6 @@ class ConfRoverTrain(ConfRover):
                 cond_rigids = cond_rigids[:, None, ...]
                 cond_pseudo_beta = cond_pseudo_beta[:, None, ...]
                 cond_pseudo_beta_mask = cond_pseudo_beta_mask[:, None, ...]
-            dropped = self._context_dropout_mask(batch_size, cond_rigids.device)
-            if dropped is not None:
-                # The null condition is the same BEGIN token the iid task uses,
-                # repeated over the context slots: the frame count, the position
-                # ids and every downstream shape are unchanged, only the
-                # structural information is gone.
-                keep = (~dropped).to(cond_rigids.dtype)[:, None, None]
-                n_ctx = cond_rigids.shape[1]
-                cond_rigids = (
-                    keep[..., None] * cond_rigids
-                    + (1 - keep)[..., None] * begin_rigids.expand(-1, n_ctx, -1, -1)
-                )
-                cond_pseudo_beta = (
-                    keep[..., None] * cond_pseudo_beta
-                    + (1 - keep)[..., None]
-                    * begin_pseudo_beta.expand(-1, n_ctx, -1, -1)
-                )
-                cond_pseudo_beta_mask = (
-                    keep[..., 0] * cond_pseudo_beta_mask
-                    + (1 - keep)[..., 0]
-                    * begin_pseudo_beta_mask.expand(-1, n_ctx, -1)
-                )
-                self._context_dropped = float(dropped.float().mean())
             rigids = torch.cat([begin_rigids, cond_rigids], dim=1)
             pseudo_beta = torch.cat([begin_pseudo_beta, cond_pseudo_beta], dim=1)
             pseudo_beta_mask = torch.cat(

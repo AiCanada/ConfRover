@@ -1610,13 +1610,7 @@ def run_train(args: argparse.Namespace) -> None:
         lr_schedule=args.lr_schedule,
         lr_warmup_steps=args.lr_warmup_steps,
         lr_min_ratio=args.lr_min_ratio,
-        context_dropout=float(getattr(args, "context_dropout", 0.0) or 0.0),
     )
-    if model.context_dropout > 0:
-        log.info(
-            f"Context dropout {model.context_dropout:g}: that fraction of forward "
-            "examples trains the unconditional score (guidance-ready weights)"
-        )
 
     datamodule = ConfRoverDataModule(
         train_dataset=train_dataset, val_dataset=val_dataset
@@ -2053,16 +2047,6 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Cosine floor as a fraction of --lr (0.1 -> 1e-5 when lr is 1e-4).",
-    )
-    model.add_argument(
-        "--context_dropout",
-        type=float,
-        default=0.0,
-        help="Probability that a forward example's context frames are replaced "
-        "by the BEGIN mask token during training, so one set of weights learns "
-        "the conditional and the unconditional score (classifier-free guidance "
-        "for trajectory conditioning). 0.1 is the usual value; 0 disables. "
-        "Validation always sees the real context.",
     )
     model.add_argument("--weight_decay", type=float, default=0.0)
     model.add_argument("--tmin", type=float, default=0.01)
