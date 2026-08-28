@@ -60,6 +60,11 @@ WARMUP="${WARMUP:-50}"
 MIN_RATIO="${MIN_RATIO:-0.1}"
 ACCUM="${ACCUM:-1}"
 EMA_DECAY="${EMA_DECAY:-0}"
+# CONTEXT_DROPOUT=0.1 makes the weights guidance-ready (the model learns the
+# unconditional score too); TIME_REVERSAL=true doubles the forward window pool
+# with backwards windows. Both off by default so a rerun reproduces v888.
+CONTEXT_DROPOUT="${CONTEXT_DROPOUT:-0}"
+TIME_REVERSAL="${TIME_REVERSAL:-false}"
 VAL_EVERY="${VAL_EVERY:-500}"
 CKPT_EVERY="${CKPT_EVERY:-500}"
 HF_SYNC="${HF_SYNC:-0}"
@@ -85,7 +90,7 @@ if [[ "$TF32" == "1" ]]; then
   echo "TF32 ON (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1)"
 fi
 echo "run=$RUN_NAME  window=$WINDOW  one_pass=$ONE_PASS  iid_stride=$IID_STRIDE  max_epochs=$MAX_EPOCHS  workers=$WORKERS  hf_sync=$HF_SYNC  tf32=$TF32"
-echo "recipe: ckpt_prefix=$CKPT_PREFIX lr=$LR warmup=$WARMUP min_ratio=$MIN_RATIO accum=$ACCUM ema_decay=$EMA_DECAY val_every=$VAL_EVERY ckpt_every=$CKPT_EVERY"
+echo "recipe: ckpt_prefix=$CKPT_PREFIX lr=$LR warmup=$WARMUP min_ratio=$MIN_RATIO accum=$ACCUM ema_decay=$EMA_DECAY val_every=$VAL_EVERY ckpt_every=$CKPT_EVERY context_dropout=$CONTEXT_DROPOUT time_reversal=$TIME_REVERSAL"
 echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
 : "${HF_TOKEN:?export HF_TOKEN (read on $HF_REPO and $WEIGHTS_REPO)}"
 pip install -q "huggingface_hub>=0.23"
@@ -165,6 +170,8 @@ DATA_FLAGS=(
   --ckpt_prefix "$CKPT_PREFIX"
   --window_frames "$WINDOW"
   --one_pass_frames "$ONE_PASS"
+  --time_reversal "$TIME_REVERSAL"
+  --context_dropout "$CONTEXT_DROPOUT"
   --tasks iid,forward
   --iid_frame_stride "$IID_STRIDE"
   --forward_stride_frames 1-1024

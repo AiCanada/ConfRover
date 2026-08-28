@@ -179,8 +179,12 @@ def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_window
     # the optimisation recipe is env-driven so dpf_from_base_v2 (lr 3e-5, warm-up
     # 500, accumulate 4, EMA 0.999) and the v888 defaults share one script
     for knob in ('--lr "$LR"', '--lr_warmup_steps "$WARMUP"', '--accumulate_grad_batches "$ACCUM"',
-                 '--ema_decay "$EMA_DECAY"', '--val_every_n_steps "$VAL_EVERY"'):
+                 '--ema_decay "$EMA_DECAY"', '--val_every_n_steps "$VAL_EVERY"',
+                 '--time_reversal "$TIME_REVERSAL"', '--context_dropout "$CONTEXT_DROPOUT"'):
         assert knob in text, knob
+    # both default off so a rerun of this script reproduces the v888 recipe
+    assert 'CONTEXT_DROPOUT="${CONTEXT_DROPOUT:-0}"' in text
+    assert 'TIME_REVERSAL="${TIME_REVERSAL:-false}"' in text
     # v888's seed checkpoint (run/checkpoints/*) is in the payload manifest, so it
     # is downloaded for the verify step -- but never copied into $RUN, where
     # --resume auto would otherwise continue v888 instead of starting from $WEIGHTS.
