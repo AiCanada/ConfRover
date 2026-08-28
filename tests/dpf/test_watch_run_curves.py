@@ -318,3 +318,27 @@ def test_the_live_only_button_flips_both_ways_and_says_which_it_is():
         assert len(repaints) == 2
     finally:
         root.destroy()
+
+
+def test_zoom_scales_the_render_not_the_figure():
+    """Zooming by dpi keeps inches -- and so the layout -- fixed: the panels
+    cannot reflow and the scroll region cannot go stale, which is what left the
+    bottom panels unreachable when zoom resized the figure instead."""
+    assert watch.zoom_dpi(100.0, 1.25) == 125.0
+    assert watch.zoom_dpi(100.0, 1 / 1.25) == 80.0
+    assert watch.zoom_dpi(watch.MAX_DPI, 2.0) == watch.MAX_DPI, "clamped at the top"
+    assert watch.zoom_dpi(watch.MIN_DPI, 0.1) == watch.MIN_DPI, "and at the bottom"
+
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(12, 18), dpi=100)
+    try:
+        inches_before = tuple(fig.get_size_inches())
+        fig.set_dpi(watch.zoom_dpi(fig.dpi, 1.25))
+        assert tuple(fig.get_size_inches()) == inches_before, "inches never move"
+        # the raster is what grew: 12 x 125 = 1500 px wide
+        assert int(round(fig.get_size_inches()[0] * fig.dpi)) == 1500
+    finally:
+        plt.close(fig)

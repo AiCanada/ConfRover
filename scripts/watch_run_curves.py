@@ -19,8 +19,9 @@ The x axis is the optimizer step for every run. The bar above the figure
 changes the view without restarting the watch or re-reading anything: a button
 that flips between "showing: all runs" and "showing: live run only" (the
 overlaid runs leave the figure, so a 1,000-step run is not a sliver beside a
-37,000-step one); zoom, which resizes the figure inside the scrolling canvas;
-and "fit width". The matplotlib toolbar along the bottom adds pan,
+37,000-step one); zoom, which re-renders the same figure at a higher or lower
+dpi -- the composition never moves, only the pixel count -- and "fit width",
+which picks the dpi that makes the figure exactly viewport-wide. The matplotlib toolbar along the bottom adds pan,
 rectangle zoom and home. ``--yscale``, ``--smooth`` and ``--live_only`` set
 where it starts.
 
@@ -485,6 +486,22 @@ def draw(axes, runs: list[dict], view: dict, theme: str) -> None:
         legend.get_title().set_color(palette["text"])
 
 
+#: What a zoom may scale the render to, in dots per inch. Below the floor the
+#: labels stop being legible; above the ceiling a seven-panel figure is tens of
+#: megapixels and every repaint crawls.
+MIN_DPI, MAX_DPI = 30.0, 400.0
+
+
+def zoom_dpi(current: float, factor: float) -> float:
+    """The dpi a zoom step lands on, clamped.
+
+    Zooming by dpi rather than by figure size is what keeps the layout still:
+    inches decide the composition, dpi only decides how many pixels it is drawn
+    with, so a zoom cannot reflow the panels or leave the scroll region stale.
+    """
+    return max(MIN_DPI, min(MAX_DPI, float(current) * float(factor)))
+
+
 def build_controls(parent, palette: dict, view: dict, on_change, on_refresh,
                    on_zoom=None, on_fit=None) -> dict:
     """The bar above the figure: what is shown, and how large.
@@ -633,18 +650,15 @@ def show_scrollable(fig, interval: float, fetch, render, theme: str, view: dict)
         rescroll()
 
     def on_zoom(factor: float) -> None:
-        """Resize the figure itself: with a scrolling canvas that is a real zoom,
-        not a rescale of the same pixels."""
-        width, height = fig.get_size_inches()
-        fig.set_size_inches(max(4.0, min(60.0, width * factor)),
-                            max(3.0, min(120.0, height * factor)))
+        """Scale the rendered image: same figure, more (or fewer) pixels."""
+        fig.set_dpi(zoom_dpi(fig.dpi, factor))
         repaint()
 
     def on_fit() -> None:
-        """Make the figure exactly as wide as the viewport, so only the vertical
-        bar is needed."""
+        """Render at whatever dpi makes the figure exactly viewport-wide, so
+        only the vertical bar is needed."""
         width_px = max(viewport.winfo_width(), 320)
-        fig.set_size_inches(width_px / fig.dpi, fig.get_size_inches()[1])
+        fig.set_dpi(max(MIN_DPI, min(MAX_DPI, width_px / fig.get_size_inches()[0])))
         repaint()
 
     widgets = build_controls(controls, palette, view, repaint,
