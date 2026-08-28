@@ -2649,6 +2649,31 @@ class TimedModelCheckpoint(ModelCheckpoint):
         drop_restart_sidecar(filepath)
 
 
+class ImprovementCheckpoint(TimedModelCheckpoint):
+    """Save only when the monitored metric beats the best so far; keep them all.
+
+    Lightning's ``save_top_k=-1`` means "save at every validation", not "keep
+    every improvement": with it, ``check_monitor_top_k`` answers True
+    unconditionally. Both cloud runs wrote a ``bestfwd`` file at every single
+    validation (44 of 44 on the DPF run while val/loss_forward bounced between
+    0.423 and 0.450), so the newest ``bestfwd`` was not the best. This keeps
+    ``save_top_k=-1`` (nothing is ever deleted) and gates the save on a strict
+    improvement over ``best_model_score``.
+    """
+
+    def check_monitor_top_k(self, trainer, current=None) -> bool:  # noqa: D102
+        if current is None:
+            return False
+        best = self.best_model_score
+        if best is None:
+            return True
+        if torch.is_tensor(current) and torch.is_tensor(best):
+            best = best.to(current.device)
+        if self.mode == "min":
+            return bool(current < best)
+        return bool(current > best)
+
+
 def _build_model_checkpoint(
     output_dir: Path, args: argparse.Namespace
 ) -> ModelCheckpoint:
@@ -2779,15 +2804,17 @@ def _build_best_val_checkpoint(
     (``set_epoch`` is called only on the train dataset), so this is comparable
     step to step in a way the train loss is not.
     """
-    return TimedModelCheckpoint(
+    return ImprovementCheckpoint(
         dirpath=str(Path(output_dir) / "checkpoints"),
         filename=f"{ckpt_prefix}-bestfwd-step{{step:08d}}",
         auto_insert_metric_name=False,
         monitor=BEST_CHECKPOINT_MONITOR,
         mode="min",
         save_last=False,
-        # Every improvement is kept (save_top_k=-1). Validation uses a
-        # deterministic t grid, so these are comparable across steps.
+        # Every improvement is kept: save_top_k=-1 so nothing is deleted, and
+        # ImprovementCheckpoint gates each save on beating the best so far
+        # (plain save_top_k=-1 would save at every validation). Validation uses
+        # a deterministic t grid, so these are comparable across steps.
         save_top_k=-1,
         save_weights_only=False,
     )

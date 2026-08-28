@@ -2325,3 +2325,21 @@ def test_tflop_probe_gives_up_on_a_non_memory_error(monkeypatch, caplog):
         cb.on_fit_start(trainer=None, pl_module=module)
     assert "Could not measure train-step TFLOP: no Triton" in caplog.text
     assert not hasattr(module, "tflops_by_task")
+
+
+def test_best_forward_checkpoint_saves_only_on_improvement(tmp_path):
+    """Lightning's save_top_k=-1 means 'save at every validation'. Both cloud
+    runs wrote a bestfwd file at every validation (44 of 44 on the DPF run while
+    val/loss_forward bounced between 0.423 and 0.450), so the newest bestfwd was
+    not the best. The gate must be a strict improvement over the best so far,
+    with nothing ever deleted."""
+    cb = train_cli._build_best_val_checkpoint(tmp_path, "dpf")
+    assert isinstance(cb, train_cli.ImprovementCheckpoint)
+    assert cb.save_top_k == -1 and cb.mode == "min" and cb.monitor == "val/loss_forward"
+
+    assert cb.check_monitor_top_k(None, torch.tensor(0.446)) is True  # first value
+    cb.best_model_score = torch.tensor(0.446)
+    assert cb.check_monitor_top_k(None, torch.tensor(0.450)) is False  # worse
+    assert cb.check_monitor_top_k(None, torch.tensor(0.446)) is False  # equal: not an improvement
+    assert cb.check_monitor_top_k(None, torch.tensor(0.439)) is True  # better
+    assert cb.check_monitor_top_k(None, None) is False
