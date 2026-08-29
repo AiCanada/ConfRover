@@ -244,6 +244,7 @@ def build_examples(
     one_pass_frames: bool = False,
     window_frames: int = 1,
     time_reversal: bool = False,
+    burn_in_frames: int = 0,
 ) -> list[TrainExample]:
     """Draw examples from each family's conformation bag.
 
@@ -321,6 +322,7 @@ def build_examples(
                     epoch=epoch,
                     one_pass=one_pass_frames,
                     time_reversal=time_reversal,
+                    burn_in_frames=burn_in_frames,
                 )
             )
             continue
@@ -397,6 +399,7 @@ def examples_from_split(
     one_pass_frames: bool = False,
     window_frames: int = 1,
     time_reversal: bool = False,
+    burn_in_frames: int = 0,
 ) -> list[TrainExample]:
     assert_no_leakage(catalog, split)
     task_list = validate_tasks(tasks)
@@ -416,6 +419,7 @@ def examples_from_split(
         one_pass_frames=one_pass_frames,
         window_frames=window_frames,
         time_reversal=time_reversal,
+        burn_in_frames=burn_in_frames,
     )
 
 
@@ -558,6 +562,7 @@ def _trajectory_windows(
     forward_stride_frames: int | tuple[int, int],
     window_frames: int,
     time_reversal: bool = False,
+    burn_in_frames: int = 0,
 ) -> list[TrainExample]:
     """Every ``window_frames``-frame window of one replica at one ladder stride.
 
@@ -575,6 +580,16 @@ def _trajectory_windows(
     recordings. The reversed window keeps ``delta_frames`` (the separation is a
     magnitude; the direction lives in the frame order), so position ids, the
     stride ladder and the permutation walk are unchanged.
+
+    ``burn_in_frames`` drops windows that start in the first N frames of a
+    replica. Reversal is licensed by the *equilibrium* path measure, and ATLAS
+    replicas all branch from one equilibrated crystal pose (only the velocity
+    seed differs), so the head of each replica is a relaxation transient whose
+    reverse is a relaxation running backwards -- the one case the equilibrium
+    argument does not cover. No published source quantifies the transient, so
+    this is 0 by default and is meant to be set from a measurement (train a
+    forward-vs-reversed discriminator on windows stratified by start offset:
+    above-chance accuracy marks the non-stationary head).
     """
     out: list[TrainExample] = []
     ladder = forward_stride_ladder(forward_stride_frames)
@@ -589,7 +604,8 @@ def _trajectory_windows(
             span = (window_frames - 1) * step
             if n_frames - span <= 0:
                 continue
-            for start in range(0, n_frames - span, sample_stride):
+            first = max(int(burn_in_frames), 0)
+            for start in range(first, n_frames - span, sample_stride):
                 frames = [start + k * step for k in range(window_frames)]
                 orders = [frames, frames[::-1]] if time_reversal else [frames]
                 for order in orders:
@@ -630,6 +646,7 @@ def _window_examples(
     epoch: int,
     one_pass: bool,
     time_reversal: bool = False,
+    burn_in_frames: int = 0,
 ) -> list[TrainExample]:
     """The ``--window_frames W`` bag for one family and epoch.
 
@@ -674,7 +691,12 @@ def _window_examples(
             )
     if "forward" in task_list:
         trajectory = _trajectory_windows(
-            bag, iid_frame_stride, forward_stride_frames, W, time_reversal=time_reversal
+            bag,
+            iid_frame_stride,
+            forward_stride_frames,
+            W,
+            time_reversal=time_reversal,
+            burn_in_frames=burn_in_frames,
         )
         if trajectory:
             out.extend(

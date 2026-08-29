@@ -177,6 +177,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         self._static_iid_cap = DEFAULT_STATIC_IID_CAP
         self._one_pass_frames = False
         self._time_reversal = False
+        self._burn_in_frames = 0
         self._window_frames = 1
         self._sample_seed = 0
         self._epoch = 0
@@ -209,6 +210,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         static_iid_cap: int = DEFAULT_STATIC_IID_CAP,
         one_pass_frames: bool = False,
         time_reversal: bool = False,
+        burn_in_frames: int = 0,
         window_frames: int = 1,
         **loader_kwargs,
     ) -> "DpfTrainDataset":
@@ -225,6 +227,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             static_iid_cap=static_iid_cap,
             one_pass_frames=one_pass_frames,
             time_reversal=time_reversal,
+            burn_in_frames=burn_in_frames,
             window_frames=window_frames,
         )
         subset = catalog.select(split.families(split_name))
@@ -243,6 +246,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         dataset._static_iid_cap = int(static_iid_cap)
         dataset._one_pass_frames = bool(one_pass_frames)
         dataset._time_reversal = bool(time_reversal)
+        dataset._burn_in_frames = int(burn_in_frames)
         dataset._window_frames = max(1, int(window_frames))
         dataset._sample_seed = int(sample_seed)
         dataset._epoch = 0
@@ -282,6 +286,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             static_iid_cap=self._static_iid_cap,
             one_pass_frames=self._one_pass_frames,
             time_reversal=self._time_reversal,
+            burn_in_frames=self._burn_in_frames,
             window_frames=self._window_frames,
         )
         self._epoch = epoch
@@ -306,6 +311,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             "static_iid_cap": int(self._static_iid_cap),
             "one_pass_frames": bool(self._one_pass_frames),
             "time_reversal": bool(self._time_reversal),
+            "burn_in_frames": int(self._burn_in_frames),
             "forward_stride_frames": self.forward_stride_spec,
             "window_frames": int(self._window_frames),
         }

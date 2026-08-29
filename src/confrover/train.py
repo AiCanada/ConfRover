@@ -1527,6 +1527,7 @@ def run_train(args: argparse.Namespace) -> None:
         static_iid_cap=args.static_iid_cap,
         one_pass_frames=bool(args.one_pass_frames),
         time_reversal=bool(getattr(args, "time_reversal", False)),
+        burn_in_frames=int(getattr(args, "traj_burn_in_frames", 0) or 0),
         window_frames=max(1, int(args.window_frames)),
         sample_seed=args.seed,
         batch_size=args.batch_size,
@@ -1876,6 +1877,18 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "single-target pairs of earlier runs. Decoder memory and time scale "
         "with W; a family's per-epoch caps count windows, so W x the frames are "
         "consumed per epoch.",
+    )
+    data.add_argument(
+        "--traj_burn_in_frames",
+        type=int,
+        default=0,
+        help="Skip windows starting in the first N frames of a trajectory "
+        "replica (ATLAS: 100 frames = 1 ns). Time reversal is licensed by the "
+        "equilibrium path measure, and every ATLAS replica branches from one "
+        "equilibrated crystal pose, so a replica's head is a relaxation "
+        "transient whose reverse is a relaxation running backwards. No "
+        "published source quantifies it, so this is 0 by default: set it from "
+        "a measurement, not a guess.",
     )
     data.add_argument(
         "--time_reversal",

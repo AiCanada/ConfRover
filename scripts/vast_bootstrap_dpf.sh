@@ -64,6 +64,10 @@ EMA_DECAY="${EMA_DECAY:-0}"
 # forward pool and teaches the dynamics rather than the arrow of the recordings.
 # On by default; TIME_REVERSAL=false reproduces the runs that predate the flag.
 TIME_REVERSAL="${TIME_REVERSAL:-true}"
+# Frames to skip at the head of each replica (100 = 1 ns of ATLAS): the
+# relaxation transient away from the crystal pose, where reversal is not
+# licensed. 0 until measured.
+BURN_IN="${BURN_IN:-0}"
 VAL_EVERY="${VAL_EVERY:-500}"
 CKPT_EVERY="${CKPT_EVERY:-500}"
 HF_SYNC="${HF_SYNC:-0}"
@@ -89,7 +93,7 @@ if [[ "$TF32" == "1" ]]; then
   echo "TF32 ON (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1)"
 fi
 echo "run=$RUN_NAME  window=$WINDOW  one_pass=$ONE_PASS  iid_stride=$IID_STRIDE  max_epochs=$MAX_EPOCHS  workers=$WORKERS  hf_sync=$HF_SYNC  tf32=$TF32"
-echo "recipe: ckpt_prefix=$CKPT_PREFIX lr=$LR warmup=$WARMUP min_ratio=$MIN_RATIO accum=$ACCUM ema_decay=$EMA_DECAY val_every=$VAL_EVERY ckpt_every=$CKPT_EVERY time_reversal=$TIME_REVERSAL"
+echo "recipe: ckpt_prefix=$CKPT_PREFIX lr=$LR warmup=$WARMUP min_ratio=$MIN_RATIO accum=$ACCUM ema_decay=$EMA_DECAY val_every=$VAL_EVERY ckpt_every=$CKPT_EVERY time_reversal=$TIME_REVERSAL burn_in=$BURN_IN"
 echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
 : "${HF_TOKEN:?export HF_TOKEN (read on $HF_REPO and $WEIGHTS_REPO)}"
 pip install -q "huggingface_hub>=0.23"
@@ -170,6 +174,7 @@ DATA_FLAGS=(
   --window_frames "$WINDOW"
   --one_pass_frames "$ONE_PASS"
   --time_reversal "$TIME_REVERSAL"
+  --traj_burn_in_frames "$BURN_IN"
   --tasks iid,forward
   --iid_frame_stride "$IID_STRIDE"
   --forward_stride_frames 1-1024

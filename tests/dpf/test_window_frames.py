@@ -460,3 +460,34 @@ def test_resume_refuses_to_switch_time_reversal_mid_lineage(tmp_path):
         ds.load_state_dict(saved)
     saved["time_reversal"] = True
     ds.load_state_dict(saved)  # matching value resumes
+
+
+def test_burn_in_skips_the_head_of_each_replica(tmp_path):
+    """Reversal is licensed by the *equilibrium* path measure. ATLAS replicas all
+    branch from one equilibrated crystal pose (only the velocity seed differs),
+    so a replica's head is a relaxation transient whose reverse is a relaxation
+    running backwards -- the one case the equilibrium argument does not cover."""
+    from confrover.data.dpf import examples as ex_mod
+
+    bag, _ = _traj_family(tmp_path, n_frames=40)
+    kwargs = dict(iid_frame_stride=4, forward_stride_frames=1, window_frames=3)
+    starts = lambda ex: sorted({e.window[0][1] for e in ex})
+
+    plain = ex_mod._trajectory_windows(bag, **kwargs)
+    assert min(starts(plain)) == 0
+
+    cut = ex_mod._trajectory_windows(bag, **kwargs, burn_in_frames=12)
+    assert min(starts(cut)) == 12 and len(cut) < len(plain)
+    # reversed windows are cut the same way: the transient is what is excluded,
+    # not one direction of it
+    both = ex_mod._trajectory_windows(bag, **kwargs, burn_in_frames=12, time_reversal=True)
+    assert len(both) == 2 * len(cut)
+    assert min(f for e in both for _, f in e.window) >= 12
+
+
+def test_burn_in_is_recorded_in_the_bag_identity_and_defaults_to_zero():
+    ds_src = (REPO / "src" / "confrover" / "data" / "dpf" / "dataset.py").read_text(encoding="utf-8")
+    assert '"burn_in_frames": int(self._burn_in_frames),' in ds_src
+    cli = (REPO / "src" / "confrover" / "train.py").read_text(encoding="utf-8")
+    i = cli.index('"--traj_burn_in_frames"')
+    assert "default=0," in cli[i:i + 200], "no evidence quantifies the transient; do not guess a default"
