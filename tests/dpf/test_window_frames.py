@@ -530,7 +530,7 @@ def test_reversal_policy_validates_and_records_itself():
     from confrover.data.dpf.examples import ReversalPolicy
 
     assert not ReversalPolicy.off().enabled
-    assert ReversalPolicy().as_dict() == {"prob": 0.5, "max_step": 64, "min_start": 100}
+    assert ReversalPolicy().as_dict() == {"prob": 0.5, "max_step": 64, "min_start": 1000}
     with pytest.raises(ValueError, match="prob"):
         ReversalPolicy(prob=1.5)
     with pytest.raises(ValueError, match="max_step"):
@@ -567,7 +567,7 @@ def test_the_cli_defaults_are_the_gated_policy():
     for flag, default in (
         ('"--time_reversal_prob"', "default=0.5,"),
         ('"--time_reversal_max_step"', "default=64,"),
-        ('"--time_reversal_min_start"', "default=100,"),
+        ('"--time_reversal_min_start"', "default=1000,"),
     ):
         i = cli.index(flag)
         assert default in cli[i:i + 300], f"{flag} default changed"

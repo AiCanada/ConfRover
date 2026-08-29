@@ -190,7 +190,7 @@ def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_window
     assert 'TIME_REVERSAL="${TIME_REVERSAL:-true}"' in text
     assert 'REVERSAL_PROB="${REVERSAL_PROB:-0.5}"' in text
     assert 'REVERSAL_MAX_STEP="${REVERSAL_MAX_STEP:-64}"' in text
-    assert 'REVERSAL_MIN_START="${REVERSAL_MIN_START:-100}"' in text
+    assert 'REVERSAL_MIN_START="${REVERSAL_MIN_START:-1000}"' in text
     assert "BURN_IN" not in text, "the retired knob deleted windows; it is gone"
     # v888's seed checkpoint (run/checkpoints/*) is in the payload manifest, so it
     # is downloaded for the verify step -- but never copied into $RUN, where

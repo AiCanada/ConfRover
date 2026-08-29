@@ -86,6 +86,26 @@ class ReversalPolicy:
       *coin*, it never deletes the window (deleting narrows the stride ladder
       and can empty a family's forward objective).
 
+    Measured, not guessed: ``scripts/audit_time_arrow.py --workers 6`` over all
+    100 DPF families (50/50 family-disjoint split, 2000 sign-flip draws,
+    2026-08-29) scored every (start bin x stride) cell for a detectable arrow of
+    time and weighted it by the windows ``_trajectory_windows`` actually emits:
+
+        gate (min_start, max_step)   contamination   arrowed cells   eligible
+        (0, 1024)  -- ungated              5.99 %        42 / 72       100 %
+        (0, 64)                            1.28 %        21 / 49        73.7 %
+        (100, 64)  -- first guess          1.03 %        14 / 42        72.9 %
+        (1000, 1024)                       3.57 %        14 / 39        88.3 %
+        (1000, 64) -- shipped              0.49 %         5 / 28        66.2 %
+        (2000, 64)                         0.28 %         2 / 21        58.7 %
+
+    The head is worse than any argument predicted: in the 0-100 bin every rung
+    from stride 16 up is classified with *perfect* accuracy (d = 1.000) -- the
+    relaxation off the crystal pose is not a subtle bias there, it is a visible
+    arrow. Contamination falls off with min_start far faster than with max_step,
+    which is why the shipped gate spends its budget on the start and keeps the
+    ladder to 64 (5.1 ns span).
+
     ``prob`` is the fraction of *eligible* windows that get flipped, decided by a
     hash of the window's own identity -- not of the epoch or the draw index -- so
     a given set of 9 conformations has one orientation for the whole run. That is
@@ -97,7 +117,7 @@ class ReversalPolicy:
 
     prob: float = 0.5
     max_step: int = 64
-    min_start: int = 100
+    min_start: int = 1000
 
     def __post_init__(self) -> None:
         if not 0.0 <= float(self.prob) <= 1.0:

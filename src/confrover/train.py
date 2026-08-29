@@ -1947,13 +1947,18 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     data.add_argument(
         "--time_reversal_min_start",
         type=int,
-        default=100,
+        default=1000,
         help="Do not reverse a window that starts in the first N frames of a "
         "replica (ATLAS: 100 frames = 1 ns). Every ATLAS replica branches from "
         "one equilibrated crystal pose, so a replica's head is a relaxation "
         "transient whose reverse is a relaxation running backwards -- the one "
         "case the equilibrium path measure does not license. The gate withholds "
-        "the coin; the window is still trained in its real forward direction.",
+        "the coin; the window is still trained in its real forward direction. "
+        "1000 (10 ns) is measured, not guessed: scripts/audit_time_arrow.py over "
+        "all 100 DPF families scores contamination 0.49%% here against 1.03%% at "
+        "100 and 5.99%% ungated, keeping 66%% of windows eligible. In the first "
+        "100 frames every rung from stride 16 up is direction-classified with "
+        "perfect accuracy.",
     )
     data.add_argument(
         "--time_reversal_max_step",
