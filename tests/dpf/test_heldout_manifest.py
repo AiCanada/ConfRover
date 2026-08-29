@@ -358,3 +358,13 @@ def test_written_forward_manifest_with_a_horizon_that_fits(tmp_path: Path, caplo
         assert list(frame_idxs) == [0, 100]
         assert list(cond_mask) == [1, 0]
     assert len({case.case_id for case in config.cases}) == len(config.cases)
+
+
+def test_the_forward_manifest_rollout_is_the_training_window_length(tmp_path):
+    """Omitting n_frames made export_heldout_manifest fall back to 2 -- a
+    two-frame rollout, which has no relaxation curve, so no direction-sensitive
+    or kinetic metric can be computed from the held-out set."""
+    cli = (Path(__file__).resolve().parents[2] / "src" / "confrover" / "train.py").read_text(encoding="utf-8")
+    i = cli.index("export_heldout_manifest(")
+    call = cli[i:i + 700]
+    assert "n_frames=max(1, int(args.window_frames))" in call, "rollout length must follow --window_frames"

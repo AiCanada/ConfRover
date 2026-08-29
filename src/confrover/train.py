@@ -1636,6 +1636,12 @@ def run_train(args: argparse.Namespace) -> None:
                 split,
                 split_name="test",
                 task_mode=task,
+                # Without this the forward manifest falls back to n_frames=2 --
+                # a two-frame rollout, which has no relaxation curve and so
+                # cannot support any direction-sensitive or kinetic metric. The
+                # run trains W-frame windows; the held-out rollout should be the
+                # same length.
+                n_frames=max(1, int(args.window_frames)),
                 stride_in_10ps=gen_stride_in_10ps(
                     args.forward_stride_frames
                 ),
