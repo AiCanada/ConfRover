@@ -60,14 +60,18 @@ WARMUP="${WARMUP:-50}"
 MIN_RATIO="${MIN_RATIO:-0.1}"
 ACCUM="${ACCUM:-1}"
 EMA_DECAY="${EMA_DECAY:-0}"
-# Also draw every forward window backwards (detailed balance): doubles the
-# forward pool and teaches the dynamics rather than the arrow of the recordings.
-# On by default; TIME_REVERSAL=false reproduces the runs that predate the flag.
+# Train a share of the forward windows in reverse temporal order. Licensed by
+# invariance of the equilibrium path measure (Bolhuis & Swenson 2021) INSIDE a
+# stationary block, which the two gates enforce: MAX_STEP caps the window span
+# ((W-1)*stride; at W=9 stride 1024 spans 81.9 ns of a 100 ns replica) and
+# MIN_START keeps the coin away from each replica's relaxation transient.
+# Orientation is applied after the draw, so the bag, the permutation, the epoch
+# length and the LR horizon match a run with REVERSAL_PROB=0 exactly -- an A/B
+# is paired. TIME_REVERSAL=false reproduces the runs that predate the flag.
 TIME_REVERSAL="${TIME_REVERSAL:-true}"
-# Frames to skip at the head of each replica (100 = 1 ns of ATLAS): the
-# relaxation transient away from the crystal pose, where reversal is not
-# licensed. 0 until measured.
-BURN_IN="${BURN_IN:-0}"
+REVERSAL_PROB="${REVERSAL_PROB:-0.5}"
+REVERSAL_MAX_STEP="${REVERSAL_MAX_STEP:-64}"
+REVERSAL_MIN_START="${REVERSAL_MIN_START:-100}"
 VAL_EVERY="${VAL_EVERY:-500}"
 CKPT_EVERY="${CKPT_EVERY:-500}"
 HF_SYNC="${HF_SYNC:-0}"
@@ -93,7 +97,7 @@ if [[ "$TF32" == "1" ]]; then
   echo "TF32 ON (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1)"
 fi
 echo "run=$RUN_NAME  window=$WINDOW  one_pass=$ONE_PASS  iid_stride=$IID_STRIDE  max_epochs=$MAX_EPOCHS  workers=$WORKERS  hf_sync=$HF_SYNC  tf32=$TF32"
-echo "recipe: ckpt_prefix=$CKPT_PREFIX lr=$LR warmup=$WARMUP min_ratio=$MIN_RATIO accum=$ACCUM ema_decay=$EMA_DECAY val_every=$VAL_EVERY ckpt_every=$CKPT_EVERY time_reversal=$TIME_REVERSAL burn_in=$BURN_IN"
+echo "recipe: ckpt_prefix=$CKPT_PREFIX lr=$LR warmup=$WARMUP min_ratio=$MIN_RATIO accum=$ACCUM ema_decay=$EMA_DECAY val_every=$VAL_EVERY ckpt_every=$CKPT_EVERY time_reversal=$TIME_REVERSAL prob=$REVERSAL_PROB max_step=$REVERSAL_MAX_STEP min_start=$REVERSAL_MIN_START"
 echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
 : "${HF_TOKEN:?export HF_TOKEN (read on $HF_REPO and $WEIGHTS_REPO)}"
 pip install -q "huggingface_hub>=0.23"
@@ -174,7 +178,9 @@ DATA_FLAGS=(
   --window_frames "$WINDOW"
   --one_pass_frames "$ONE_PASS"
   --time_reversal "$TIME_REVERSAL"
-  --traj_burn_in_frames "$BURN_IN"
+  --time_reversal_prob "$REVERSAL_PROB"
+  --time_reversal_max_step "$REVERSAL_MAX_STEP"
+  --time_reversal_min_start "$REVERSAL_MIN_START"
   --tasks iid,forward
   --iid_frame_stride "$IID_STRIDE"
   --forward_stride_frames 1-1024

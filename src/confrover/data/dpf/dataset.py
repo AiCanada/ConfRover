@@ -36,6 +36,7 @@ from confrover.utils import get_pylogger
 from .catalog import DpfCatalog, DpfMember
 from .examples import (
     DEFAULT_FORWARD_STRIDE_FRAMES,
+    ReversalPolicy,
     DEFAULT_IID_FRAME_STRIDE,
     DEFAULT_SAMPLES_PER_FAMILY,
     DEFAULT_STATIC_IID_CAP,
@@ -126,7 +127,11 @@ def _delta_frames(example: TrainExample, forward_stride_frames: int) -> int:
     if delta is not None:
         return int(delta)
     if example.source_frame_idx is not None and example.target_frame_idx is not None:
-        return int(example.target_frame_idx) - int(example.source_frame_idx)
+        # Windows always stamp delta_frames above; only single-frame pairs reach
+        # here, so the endpoint difference cannot be negative for them. abs()
+        # keeps a reversed *window* from ever reaching RoPE as a negative gap.
+        assert example.window is None, "trajectory windows must stamp delta_frames"
+        return abs(int(example.target_frame_idx) - int(example.source_frame_idx))
     return 0
 
 
@@ -176,8 +181,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         self._samples_per_family = DEFAULT_SAMPLES_PER_FAMILY
         self._static_iid_cap = DEFAULT_STATIC_IID_CAP
         self._one_pass_frames = False
-        self._time_reversal = False
-        self._burn_in_frames = 0
+        self._reversal = ReversalPolicy.off()
         self._window_frames = 1
         self._sample_seed = 0
         self._epoch = 0
@@ -209,8 +213,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         sample_seed: int = 0,
         static_iid_cap: int = DEFAULT_STATIC_IID_CAP,
         one_pass_frames: bool = False,
-        time_reversal: bool = False,
-        burn_in_frames: int = 0,
+        reversal: ReversalPolicy | None = None,
         window_frames: int = 1,
         **loader_kwargs,
     ) -> "DpfTrainDataset":
@@ -226,8 +229,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             epoch=0,
             static_iid_cap=static_iid_cap,
             one_pass_frames=one_pass_frames,
-            time_reversal=time_reversal,
-            burn_in_frames=burn_in_frames,
+            reversal=reversal,
             window_frames=window_frames,
         )
         subset = catalog.select(split.families(split_name))
@@ -245,8 +247,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
         dataset._samples_per_family = int(samples_per_family)
         dataset._static_iid_cap = int(static_iid_cap)
         dataset._one_pass_frames = bool(one_pass_frames)
-        dataset._time_reversal = bool(time_reversal)
-        dataset._burn_in_frames = int(burn_in_frames)
+        dataset._reversal = reversal or ReversalPolicy.off()
         dataset._window_frames = max(1, int(window_frames))
         dataset._sample_seed = int(sample_seed)
         dataset._epoch = 0
@@ -285,8 +286,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             epoch=epoch,
             static_iid_cap=self._static_iid_cap,
             one_pass_frames=self._one_pass_frames,
-            time_reversal=self._time_reversal,
-            burn_in_frames=self._burn_in_frames,
+            reversal=self._reversal,
             window_frames=self._window_frames,
         )
         self._epoch = epoch
@@ -310,8 +310,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             # that omitted it would silently rebuild a different epoch.
             "static_iid_cap": int(self._static_iid_cap),
             "one_pass_frames": bool(self._one_pass_frames),
-            "time_reversal": bool(self._time_reversal),
-            "burn_in_frames": int(self._burn_in_frames),
+            "reversal": self._reversal.as_dict(),
             "forward_stride_frames": self.forward_stride_spec,
             "window_frames": int(self._window_frames),
         }
@@ -340,18 +339,32 @@ class DpfTrainDataset(torch.utils.data.Dataset):
                 "with the checkpoint's value, or start a fresh run (--resume none, "
                 "or a new --output) to change the window."
             )
-        saved_reversal = bool(state_dict.get("time_reversal", False))
-        if saved_reversal != bool(self._time_reversal):
-            # Time reversal doubles the forward population, so the one-pass
-            # permutation walk draws different windows for the same epoch:
-            # resuming across the change would neither continue the old bag nor
-            # start the new one cleanly. The flag defaults to on, so this is
-            # what a resume of a run that predates it hits.
+        saved_policy = state_dict.get("reversal")
+        if saved_policy is None:
+            # Pre-policy checkpoints. A truthy legacy time_reversal means the bag
+            # was the doubled-population kind, whose epoch slices do not exist
+            # under orient-on-draw; a non-zero legacy burn_in means its start
+            # range was filtered. Either way the cursor is meaningless here.
+            legacy_rev = bool(state_dict.get("time_reversal", False))
+            legacy_burn = int(state_dict.get("burn_in_frames", 0) or 0)
+            if legacy_rev or legacy_burn:
+                raise ValueError(
+                    "Checkpoint predates ReversalPolicy and was trained with "
+                    f"time_reversal={legacy_rev} burn_in_frames={legacy_burn}; its "
+                    "sampling bag was a different population. Start a fresh run "
+                    "(--resume none, or a new --output)."
+                )
+            if self._reversal.enabled:
+                raise ValueError(
+                    "Checkpoint predates ReversalPolicy (no reversal) but this run "
+                    f"reverses windows ({self._reversal.as_dict()}). Pass "
+                    "--time_reversal false to continue it, or start a fresh run."
+                )
+        elif dict(saved_policy) != self._reversal.as_dict():
             raise ValueError(
-                f"Checkpoint was trained with --time_reversal {str(saved_reversal).lower()} "
-                f"but this run uses --time_reversal {str(bool(self._time_reversal)).lower()}. "
-                "Resume with the checkpoint's value, or start a fresh run "
-                "(--resume none, or a new --output) to change it."
+                f"Checkpoint was trained with reversal {dict(saved_policy)} but this "
+                f"run uses {self._reversal.as_dict()}. Resume with the checkpoint's "
+                "values, or start a fresh run (--resume none, or a new --output)."
             )
         epoch = state_dict.get("epoch")
         if epoch is not None:

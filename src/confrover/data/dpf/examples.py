@@ -22,7 +22,7 @@ from that bag so a 1-PDB family and a 10,000-frame replica contribute equally.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Literal, Sequence, TypeVar
 
@@ -58,6 +58,127 @@ DEFAULT_SAMPLES_PER_FAMILY = 8
 DEFAULT_STATIC_IID_CAP = 36
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class ReversalPolicy:
+    """When a forward window may be flipped into reverse temporal order.
+
+    Reversal is licensed by invariance of the **equilibrium path measure**
+    ``P[x] = rho(x_0) prod_i p(x_i -> x_i+1) / Z`` under the reversal involution
+    (Bolhuis & Swenson, Adv. Theory Simul. 4:2000237, 2021) -- *not* by the
+    integrator being time-reversible, which licenses nothing on its own. ATLAS
+    meets the precondition (unbiased GROMACS/CHARMM36m, Nose-Hoover, no biasing)
+    and ships coordinate-only frames at 10 ps, so the ``(r, p) -> (r, -p)`` flip
+    is invisible and reversing the frame order is the complete realisation.
+
+    The licence holds only inside a **stationary block**, which is what the two
+    gates enforce:
+
+    * ``max_step``: a W-frame window at stride ``s`` spans ``(W-1)*s`` frames.
+      At W=9 that is 81.9 ns of a 100 ns ATLAS replica for ``s=1024`` and 41.0 ns
+      for 512 -- no start offset places those inside a stationary block, so the
+      widest rungs must not be reversed at all.
+    * ``min_start``: every ATLAS replica branches from one equilibrated crystal
+      pose (only the velocity seed differs), so a replica's head is a relaxation
+      transient whose reverse is a relaxation running backwards. Windows that
+      start there keep their real forward direction; the gate withholds the
+      *coin*, it never deletes the window (deleting narrows the stride ladder
+      and can empty a family's forward objective).
+
+    ``prob`` is the fraction of *eligible* windows that get flipped, decided by a
+    hash of the window's own identity -- not of the epoch or the draw index -- so
+    a given set of 9 conformations has one orientation for the whole run. That is
+    what keeps the ``--one_pass_frames`` promise: a window and its mirror hold
+    the same 9 conformations, so emitting both (the previous implementation) made
+    them independently drawable and, because ``samples_per_family`` caps *draws*
+    rather than population, halved the ascending content instead of doubling it.
+    """
+
+    prob: float = 0.5
+    max_step: int = 64
+    min_start: int = 100
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= float(self.prob) <= 1.0:
+            raise ValueError(f"reversal prob must be in [0, 1], got {self.prob}")
+        if int(self.max_step) < 0 or int(self.min_start) < 0:
+            raise ValueError("reversal max_step and min_start must be >= 0")
+
+    @classmethod
+    def off(cls) -> "ReversalPolicy":
+        return cls(prob=0.0)
+
+    @property
+    def enabled(self) -> bool:
+        return float(self.prob) > 0.0
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "prob": float(self.prob),
+            "max_step": int(self.max_step),
+            "min_start": int(self.min_start),
+        }
+
+    def eligible(self, start: int, step: int) -> bool:
+        return (
+            self.enabled
+            and int(start) >= int(self.min_start)
+            and int(step) <= int(self.max_step)
+        )
+
+
+def _reversal_bit(
+    seed: int, family_id: str, member_id: str, start: int, step: int, prob: float
+) -> bool:
+    """Deterministic per-window coin, keyed on the window's identity only.
+
+    Keyed on ``(seed, family_id, member_id, start, step)`` and nothing else, so
+    the same 9 conformations get the same orientation in every epoch, on every
+    worker, and across a resume.
+    """
+    if prob <= 0.0:
+        return False
+    if prob >= 1.0:
+        return True
+    key = f"{seed}|{family_id}|{member_id}|{start}|{step}".encode()
+    draw = int.from_bytes(hashlib.sha256(key).digest()[:8], "big") / float(1 << 64)
+    return draw < float(prob)
+
+
+def orient_window(
+    example: TrainExample, *, seed: int, policy: ReversalPolicy
+) -> TrainExample:
+    """Return ``example`` or its time-reverse, per ``policy``.
+
+    Applied to the windows a draw actually returned, so the population, the
+    permutation, the bag size, the epoch length and the LR horizon are identical
+    with reversal on and off -- which is also what makes an A/B paired.
+    """
+    window = example.window
+    if not policy.enabled or window is None or example.delta_frames is None:
+        return example
+    if example.task_mode != "forward" or len(window) < 2:
+        return example
+    frames = [f for _, f in window]
+    if any(f is None for f in frames):
+        return example
+    start, step = min(frames), int(example.delta_frames)
+    if not policy.eligible(start, step):
+        return example
+    member_id = window[0][0].member_id
+    if not _reversal_bit(seed, example.family_id, member_id, start, step, policy.prob):
+        return example
+    reversed_window = tuple(reversed(window))
+    # All four source/target fields move together or _validate_window rejects it.
+    return replace(
+        example,
+        window=reversed_window,
+        source=reversed_window[0][0],
+        target=reversed_window[-1][0],
+        source_frame_idx=reversed_window[0][1],
+        target_frame_idx=reversed_window[-1][1],
+    )
 
 
 @dataclass(frozen=True)
@@ -243,8 +364,7 @@ def build_examples(
     static_iid_cap: int = DEFAULT_STATIC_IID_CAP,
     one_pass_frames: bool = False,
     window_frames: int = 1,
-    time_reversal: bool = False,
-    burn_in_frames: int = 0,
+    reversal: "ReversalPolicy | None" = None,
 ) -> list[TrainExample]:
     """Draw examples from each family's conformation bag.
 
@@ -321,8 +441,7 @@ def build_examples(
                     seed=seed,
                     epoch=epoch,
                     one_pass=one_pass_frames,
-                    time_reversal=time_reversal,
-                    burn_in_frames=burn_in_frames,
+                    reversal=reversal,
                 )
             )
             continue
@@ -398,8 +517,7 @@ def examples_from_split(
     static_iid_cap: int = DEFAULT_STATIC_IID_CAP,
     one_pass_frames: bool = False,
     window_frames: int = 1,
-    time_reversal: bool = False,
-    burn_in_frames: int = 0,
+    reversal: "ReversalPolicy | None" = None,
 ) -> list[TrainExample]:
     assert_no_leakage(catalog, split)
     task_list = validate_tasks(tasks)
@@ -418,8 +536,7 @@ def examples_from_split(
         static_iid_cap=static_iid_cap,
         one_pass_frames=one_pass_frames,
         window_frames=window_frames,
-        time_reversal=time_reversal,
-        burn_in_frames=burn_in_frames,
+        reversal=reversal,
     )
 
 
@@ -561,35 +678,22 @@ def _trajectory_windows(
     iid_frame_stride: int,
     forward_stride_frames: int | tuple[int, int],
     window_frames: int,
-    time_reversal: bool = False,
-    burn_in_frames: int = 0,
 ) -> list[TrainExample]:
     """Every ``window_frames``-frame window of one replica at one ladder stride.
 
     This is the pre-training layout (arXiv:2505.17478, App. D.2: random 9-frame
     windows at strides 1-1024): frames ``start, start+step, ..., start+(W-1)*step``
-    of a single XTC. ``start`` advances by ``iid_frame_stride`` and ``step``
-    walks the ladder, exactly as the pair candidates do, so the population a
-    permutation walk draws from has the same shape as before -- only the
-    examples are wider.
+    of a single XTC, ascending. ``start`` advances by ``iid_frame_stride`` and
+    ``step`` walks the ladder, exactly as the pair candidates do, so the
+    population a permutation walk draws from has the same shape as before --
+    only the examples are wider.
 
-    ``time_reversal=True`` also emits each window backwards. Equilibrium MD
-    obeys detailed balance, so a reversed trajectory is as physical as the
-    forward one: it doubles the forward population for free and teaches the
-    temporal trunk the dynamics rather than the arrow of these particular
-    recordings. The reversed window keeps ``delta_frames`` (the separation is a
-    magnitude; the direction lives in the frame order), so position ids, the
-    stride ladder and the permutation walk are unchanged.
-
-    ``burn_in_frames`` drops windows that start in the first N frames of a
-    replica. Reversal is licensed by the *equilibrium* path measure, and ATLAS
-    replicas all branch from one equilibrated crystal pose (only the velocity
-    seed differs), so the head of each replica is a relaxation transient whose
-    reverse is a relaxation running backwards -- the one case the equilibrium
-    argument does not cover. No published source quantifies the transient, so
-    this is 0 by default and is meant to be set from a measurement (train a
-    forward-vs-reversed discriminator on windows stratified by start offset:
-    above-chance accuracy marks the non-stationary head).
+    Time reversal is deliberately *not* applied here: emitting both orders would
+    put two entries holding the same 9 conformations into the population, which
+    (a) makes both independently drawable, breaking the ``--one_pass_frames``
+    promise, and (b) because ``samples_per_family`` caps draws rather than
+    population, halves the ascending content instead of doubling it. Orientation
+    is decided after the draw instead -- see :func:`orient_window`.
     """
     out: list[TrainExample] = []
     ladder = forward_stride_ladder(forward_stride_frames)
@@ -604,24 +708,21 @@ def _trajectory_windows(
             span = (window_frames - 1) * step
             if n_frames - span <= 0:
                 continue
-            first = max(int(burn_in_frames), 0)
-            for start in range(first, n_frames - span, sample_stride):
+            for start in range(0, n_frames - span, sample_stride):
                 frames = [start + k * step for k in range(window_frames)]
-                orders = [frames, frames[::-1]] if time_reversal else [frames]
-                for order in orders:
-                    out.append(
-                        TrainExample(
-                            family_id=bag.family_id,
-                            seqres=bag.seqres,
-                            task_mode="forward",
-                            source=member,
-                            target=member,
-                            source_frame_idx=order[0],
-                            target_frame_idx=order[-1],
-                            delta_frames=step,
-                            window=tuple((member, f) for f in order),
-                        )
+                out.append(
+                    TrainExample(
+                        family_id=bag.family_id,
+                        seqres=bag.seqres,
+                        task_mode="forward",
+                        source=member,
+                        target=member,
+                        source_frame_idx=frames[0],
+                        target_frame_idx=frames[-1],
+                        delta_frames=step,
+                        window=tuple((member, f) for f in frames),
                     )
+                )
     return out
 
 
@@ -645,8 +746,7 @@ def _window_examples(
     seed: int,
     epoch: int,
     one_pass: bool,
-    time_reversal: bool = False,
-    burn_in_frames: int = 0,
+    reversal: "ReversalPolicy | None" = None,
 ) -> list[TrainExample]:
     """The ``--window_frames W`` bag for one family and epoch.
 
@@ -691,24 +791,30 @@ def _window_examples(
             )
     if "forward" in task_list:
         trajectory = _trajectory_windows(
-            bag,
-            iid_frame_stride,
-            forward_stride_frames,
-            W,
-            time_reversal=time_reversal,
-            burn_in_frames=burn_in_frames,
+            bag, iid_frame_stride, forward_stride_frames, W
         )
         if trajectory:
-            out.extend(
-                _walk_k(
-                    trajectory,
-                    min(samples_per_family, len(trajectory)),
-                    seed=seed,
-                    family_id=bag.family_id,
-                    epoch=epoch,
-                    tag="forward",
-                    one_pass=one_pass,
-                )
+            policy = reversal or ReversalPolicy.off()
+            drawn = _walk_k(
+                trajectory,
+                min(samples_per_family, len(trajectory)),
+                seed=seed,
+                family_id=bag.family_id,
+                epoch=epoch,
+                tag="forward",
+                one_pass=one_pass,
+            )
+            # Orientation is applied to what was drawn, so the population and
+            # the permutation are identical with reversal on and off.
+            out.extend(orient_window(ex, seed=seed, policy=policy) for ex in drawn)
+        elif any(slot.member.is_trajectory for slot in bag.iid_slots):
+            # A trajectory family with no windows must not fall through to the
+            # static-pair branch, which would stamp gap-0 "personality pairs"
+            # over the forward-dynamics objective without a word in the log.
+            raise ValueError(
+                f"Family {bag.family_id!r} has trajectory members but produced no "
+                f"{W}-frame windows at strides {forward_stride_frames} "
+                "(replica too short for the widest rung?)"
             )
         else:
             static: list[DpfMember] = []

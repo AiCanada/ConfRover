@@ -378,7 +378,7 @@ def test_tflop_report_names_the_window_in_its_message(caplog):
     assert module.tflops_window_frames == 9
 
 
-# --- time-reversal augmentation ----------------------------------------------
+# --- time reversal: orient-on-draw, gated on stride and start -----------------
 
 
 def _traj_family(tmp_path, n_frames=40):
@@ -397,97 +397,180 @@ def _traj_family(tmp_path, n_frames=40):
         seqres="AAAA",
         iid_slots=[ex_mod.IidSlot(member=member, frame_idx=i) for i in range(n_frames)],
     )
-    ex_mod._N_FRAMES_CACHE[(str(xtc.resolve()), xtc.stat().st_size, int(xtc.stat().st_mtime))] = n_frames
+    st = xtc.stat()
+    ex_mod._N_FRAMES_CACHE[(str(xtc.resolve()), st.st_size, int(st.st_mtime))] = n_frames
     return bag, member
 
 
-def test_time_reversal_emits_each_window_backwards_as_well(tmp_path):
-    """Equilibrium MD obeys detailed balance: the reversed window is as physical
-    as the forward one, doubling the population for free."""
+def _frames(example):
+    return tuple(f for _, f in example.window)
+
+
+def test_the_population_is_ascending_only_so_the_bag_is_identical(tmp_path):
+    """Emitting both orders put two entries holding the SAME 9 conformations into
+    the population: both became independently drawable (breaking one_pass) and,
+    because samples_per_family caps DRAWS not population, ascending content was
+    halved rather than doubled. Orientation happens after the draw instead, so
+    the population, permutation, bag size and LR horizon are reversal-invariant."""
+    import inspect
+
     from confrover.data.dpf import examples as ex_mod
 
     bag, _ = _traj_family(tmp_path)
-    kwargs = dict(iid_frame_stride=8, forward_stride_frames=1, window_frames=3)
-    plain = ex_mod._trajectory_windows(bag, **kwargs)
-    doubled = ex_mod._trajectory_windows(bag, **kwargs, time_reversal=True)
-    assert len(doubled) == 2 * len(plain)
-
-    def frames(e):
-        return tuple(f for _, f in e.window)
-
-    forward = {frames(e) for e in plain}
-    both = {frames(e) for e in doubled}
-    assert both == forward | {tuple(reversed(f)) for f in forward}
-    # a reversed window is a well-formed descending window with the same
-    # separation; direction lives in the order, not in delta_frames
-    rev = next(e for e in doubled if frames(e)[0] > frames(e)[-1])
-    assert list(frames(rev)) == sorted(frames(rev), reverse=True)
-    assert rev.delta_frames == 1
-    assert rev.source_frame_idx == frames(rev)[0] and rev.target_frame_idx == frames(rev)[-1]
+    windows = ex_mod._trajectory_windows(bag, 4, 1, 3)
+    assert windows, "sanity"
+    for w in windows:
+        assert list(_frames(w)) == sorted(_frames(w)), "population must be ascending only"
+    params = inspect.signature(ex_mod._trajectory_windows).parameters
+    assert "time_reversal" not in params and "burn_in_frames" not in params
 
 
-def test_time_reversal_is_off_by_default_and_is_a_dataset_state_field():
-    from confrover.data.dpf.dataset import DpfTrainDataset
-
-    assert "time_reversal" in DpfTrainDataset.state_dict.__doc__ or True
-    text = (REPO / "src" / "confrover" / "data" / "dpf" / "dataset.py").read_text(encoding="utf-8")
-    assert '"time_reversal": bool(self._time_reversal),' in text, "bag identity must record it"
-    cli = (REPO / "src" / "confrover" / "train.py").read_text(encoding="utf-8")
-    assert '"--time_reversal"' in cli
-    # on by default (2026-08-29): every run before the flag existed used the
-    # forward-time bag, so reproducing one needs --time_reversal false
-    i = cli.index('"--time_reversal"')
-    assert "default=True," in cli[i:i + 400]
-    # validation keeps the forward-time bag: only the train dataset gets the flag
-    assert cli.count('time_reversal=bool(getattr(args, "time_reversal", False)),') == 1
-
-
-
-def test_resume_refuses_to_switch_time_reversal_mid_lineage(tmp_path):
-    """Time reversal doubles the forward population, so the one-pass walk draws
-    different windows for the same epoch. The flag now defaults to on, so this
-    is what resuming a run that predates it would otherwise hit silently."""
-    from confrover.data.dpf.dataset import DpfTrainDataset
-
-    ds = DpfTrainDataset.__new__(DpfTrainDataset)
-    ds._sample_seed = 42
-    ds._window_frames = 9
-    ds._time_reversal = True
-    ds._split = None
-    ds._epoch = 0
-    saved = {"epoch": 3, "sample_seed": 42, "window_frames": 9, "time_reversal": False}
-    with pytest.raises(ValueError, match="--time_reversal false"):
-        ds.load_state_dict(saved)
-    saved["time_reversal"] = True
-    ds.load_state_dict(saved)  # matching value resumes
-
-
-def test_burn_in_skips_the_head_of_each_replica(tmp_path):
-    """Reversal is licensed by the *equilibrium* path measure. ATLAS replicas all
-    branch from one equilibrated crystal pose (only the velocity seed differs),
-    so a replica's head is a relaxation transient whose reverse is a relaxation
-    running backwards -- the one case the equilibrium argument does not cover."""
+def test_orientation_is_keyed_on_window_identity_not_epoch(tmp_path):
+    """A given set of 9 conformations must keep ONE orientation for the whole run:
+    that is what makes a mirror pair structurally impossible."""
     from confrover.data.dpf import examples as ex_mod
 
-    bag, _ = _traj_family(tmp_path, n_frames=40)
-    kwargs = dict(iid_frame_stride=4, forward_stride_frames=1, window_frames=3)
-    starts = lambda ex: sorted({e.window[0][1] for e in ex})
-
-    plain = ex_mod._trajectory_windows(bag, **kwargs)
-    assert min(starts(plain)) == 0
-
-    cut = ex_mod._trajectory_windows(bag, **kwargs, burn_in_frames=12)
-    assert min(starts(cut)) == 12 and len(cut) < len(plain)
-    # reversed windows are cut the same way: the transient is what is excluded,
-    # not one direction of it
-    both = ex_mod._trajectory_windows(bag, **kwargs, burn_in_frames=12, time_reversal=True)
-    assert len(both) == 2 * len(cut)
-    assert min(f for e in both for _, f in e.window) >= 12
+    bag, _ = _traj_family(tmp_path, n_frames=400)
+    policy = ex_mod.ReversalPolicy(prob=0.5, max_step=64, min_start=0)
+    windows = ex_mod._trajectory_windows(bag, 4, 1, 3)
+    once = [ex_mod.orient_window(w, seed=42, policy=policy) for w in windows]
+    again = [ex_mod.orient_window(w, seed=42, policy=policy) for w in windows]
+    assert [_frames(a) for a in once] == [_frames(b) for b in again], "not deterministic"
+    other = [ex_mod.orient_window(w, seed=7, policy=policy) for w in windows]
+    assert [_frames(a) for a in once] != [_frames(b) for b in other]
+    share = sum(1 for w in once if _frames(w)[0] > _frames(w)[-1]) / len(once)
+    assert 0.3 < share < 0.7, f"prob 0.5 gave {share:.2f}"
 
 
-def test_burn_in_is_recorded_in_the_bag_identity_and_defaults_to_zero():
-    ds_src = (REPO / "src" / "confrover" / "data" / "dpf" / "dataset.py").read_text(encoding="utf-8")
-    assert '"burn_in_frames": int(self._burn_in_frames),' in ds_src
+def test_a_reversed_window_is_well_formed_and_keeps_a_positive_gap(tmp_path):
+    from confrover.data.dpf import examples as ex_mod
+    from confrover.data.dpf.dataset import _delta_frames
+
+    bag, _ = _traj_family(tmp_path, n_frames=400)
+    policy = ex_mod.ReversalPolicy(prob=1.0, max_step=64, min_start=0)
+    w = ex_mod._trajectory_windows(bag, 4, 2, 3)[5]
+    r = ex_mod.orient_window(w, seed=1, policy=policy)
+    assert list(_frames(r)) == sorted(_frames(w), reverse=True)
+    assert r.source_frame_idx == _frames(r)[0] and r.target_frame_idx == _frames(r)[-1]
+    # delta_frames is the separation MAGNITUDE: RoPE must never see a negative gap
+    assert r.delta_frames == w.delta_frames == 2
+    assert _delta_frames(r, 256) == 2
+
+
+def test_the_stride_gate_protects_the_unlicensed_rungs(tmp_path):
+    """A W-frame window spans (W-1)*stride. At W=9 that is 81.9 ns of a 100 ns
+    ATLAS replica for stride 1024, so no start offset puts it inside a stationary
+    block and the equilibrium path measure licenses nothing there."""
+    from confrover.data.dpf import examples as ex_mod
+
+    bag, _ = _traj_family(tmp_path, n_frames=4000)
+    policy = ex_mod.ReversalPolicy(prob=1.0, max_step=64, min_start=0)
+    for step, licensed in ((8, True), (64, True), (128, False), (1024, False)):
+        windows = ex_mod._trajectory_windows(bag, 200, step, 3)
+        if not windows:
+            continue
+        oriented = [ex_mod.orient_window(w, seed=3, policy=policy) for w in windows]
+        flipped = any(_frames(o)[0] > _frames(o)[-1] for o in oriented)
+        assert flipped is licensed, f"step {step}: flipped={flipped}"
+
+
+def test_the_start_gate_withholds_the_coin_it_does_not_delete_the_window(tmp_path):
+    """The head of a replica is a relaxation transient, so its REVERSE is
+    unlicensed -- but its forward direction is real recorded physics. Deleting it
+    would narrow the stride ladder and could empty a family's forward objective."""
+    from confrover.data.dpf import examples as ex_mod
+
+    bag, _ = _traj_family(tmp_path, n_frames=400)
+    windows = ex_mod._trajectory_windows(bag, 4, 1, 3)
+    policy = ex_mod.ReversalPolicy(prob=1.0, max_step=64, min_start=100)
+    oriented = [ex_mod.orient_window(w, seed=5, policy=policy) for w in windows]
+    assert len(oriented) == len(windows), "no window may be dropped"
+    for o in oriented:
+        start = min(_frames(o))
+        flipped = _frames(o)[0] > _frames(o)[-1]
+        assert flipped == (start >= 100), f"start {start} flipped {flipped}"
+
+
+def test_reversal_is_a_no_op_for_static_pdb_cluster_families():
+    """PDB-cluster families have no time axis at all; reversal must not touch
+    them, and iid windows are never reversed."""
+    from confrover.data.dpf import examples as ex_mod
+    from confrover.data.dpf.catalog import DpfMember
+
+    policy = ex_mod.ReversalPolicy(prob=1.0, max_step=1024, min_start=0)
+    a = DpfMember(member_id="1abc_A", pdb_path="a.pdb")
+    b = DpfMember(member_id="1abd_B", pdb_path="b.pdb")
+    static = TrainExample(
+        family_id="c", seqres="AAAA", task_mode="forward", source=a, target=b,
+        window=((a, None), (b, None)),
+    )
+    assert ex_mod.orient_window(static, seed=1, policy=policy) is static
+    iid = TrainExample(
+        family_id="c", seqres="AAAA", task_mode="iid", target=b,
+        window=((a, None), (b, None)),
+    )
+    assert ex_mod.orient_window(iid, seed=1, policy=policy) is iid
+
+
+def test_a_trajectory_family_with_no_windows_raises_instead_of_falling_back(tmp_path):
+    """The static branch would stamp gap-0 'personality pairs' over the
+    forward-dynamics objective without a word in the log."""
+    from confrover.data.dpf import examples as ex_mod
+
+    bag, _ = _traj_family(tmp_path, n_frames=8)  # too short for a 9-frame window
+    with pytest.raises(ValueError, match="produced no 9-frame windows"):
+        ex_mod._window_examples(
+            bag, ["forward"], window_frames=9, iid_cap=8, samples_per_family=8,
+            iid_frame_stride=4, forward_stride_frames=1, seed=0, epoch=0,
+            one_pass=False,
+        )
+
+
+def test_reversal_policy_validates_and_records_itself():
+    from confrover.data.dpf.examples import ReversalPolicy
+
+    assert not ReversalPolicy.off().enabled
+    assert ReversalPolicy().as_dict() == {"prob": 0.5, "max_step": 64, "min_start": 100}
+    with pytest.raises(ValueError, match="prob"):
+        ReversalPolicy(prob=1.5)
+    with pytest.raises(ValueError, match="max_step"):
+        ReversalPolicy(prob=0.5, max_step=-1)
+
+
+def test_resume_refuses_to_switch_the_reversal_policy():
+    """The policy is part of the bag identity; a checkpoint that predates it and
+    was trained with the doubled population cannot be continued at all."""
+    from confrover.data.dpf.dataset import DpfTrainDataset
+    from confrover.data.dpf.examples import ReversalPolicy
+
+    ds = DpfTrainDataset.__new__(DpfTrainDataset)
+    ds._sample_seed, ds._window_frames, ds._split, ds._epoch = 42, 9, None, 0
+    ds._reversal = ReversalPolicy(prob=0.5, max_step=64, min_start=100)
+    base = {"epoch": 3, "sample_seed": 42, "window_frames": 9}
+
+    with pytest.raises(ValueError, match="predates ReversalPolicy"):
+        ds.load_state_dict({**base, "time_reversal": True})
+    with pytest.raises(ValueError, match="predates ReversalPolicy"):
+        ds.load_state_dict({**base, "time_reversal": False, "burn_in_frames": 500})
+    with pytest.raises(ValueError, match="predates ReversalPolicy"):
+        ds.load_state_dict(dict(base))
+    with pytest.raises(ValueError, match="trained with reversal"):
+        ds.load_state_dict({**base, "reversal": {"prob": 1.0, "max_step": 64, "min_start": 100}})
+    ds.load_state_dict({**base, "reversal": ds._reversal.as_dict()})
+
+    ds._reversal = ReversalPolicy.off()
+    ds.load_state_dict(dict(base))  # a pre-flag run resumes under --time_reversal false
+
+
+def test_the_cli_defaults_are_the_gated_policy():
     cli = (REPO / "src" / "confrover" / "train.py").read_text(encoding="utf-8")
-    i = cli.index('"--traj_burn_in_frames"')
-    assert "default=0," in cli[i:i + 200], "no evidence quantifies the transient; do not guess a default"
+    for flag, default in (
+        ('"--time_reversal_prob"', "default=0.5,"),
+        ('"--time_reversal_max_step"', "default=64,"),
+        ('"--time_reversal_min_start"', "default=100,"),
+    ):
+        i = cli.index(flag)
+        assert default in cli[i:i + 300], f"{flag} default changed"
+    i = cli.index('"--time_reversal",')
+    assert "default=True," in cli[i:i + 400], "master switch stays on by default"
+    assert '"--traj_burn_in_frames"' in cli and "retired" in cli

@@ -180,10 +180,18 @@ def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_window
     # 500, accumulate 4, EMA 0.999) and the v888 defaults share one script
     for knob in ('--lr "$LR"', '--lr_warmup_steps "$WARMUP"', '--accumulate_grad_batches "$ACCUM"',
                  '--ema_decay "$EMA_DECAY"', '--val_every_n_steps "$VAL_EVERY"',
-                 '--time_reversal "$TIME_REVERSAL"'):
+                 '--time_reversal "$TIME_REVERSAL"',
+                 '--time_reversal_prob "$REVERSAL_PROB"',
+                 '--time_reversal_max_step "$REVERSAL_MAX_STEP"',
+                 '--time_reversal_min_start "$REVERSAL_MIN_START"'):
         assert knob in text, knob
-    # on by default; TIME_REVERSAL=false reproduces the runs predating the flag
+    # on by default, but gated: the span of a (W-1)*stride window must fit inside
+    # a stationary block, and the coin stays away from each replica's head
     assert 'TIME_REVERSAL="${TIME_REVERSAL:-true}"' in text
+    assert 'REVERSAL_PROB="${REVERSAL_PROB:-0.5}"' in text
+    assert 'REVERSAL_MAX_STEP="${REVERSAL_MAX_STEP:-64}"' in text
+    assert 'REVERSAL_MIN_START="${REVERSAL_MIN_START:-100}"' in text
+    assert "BURN_IN" not in text, "the retired knob deleted windows; it is gone"
     # v888's seed checkpoint (run/checkpoints/*) is in the payload manifest, so it
     # is downloaded for the verify step -- but never copied into $RUN, where
     # --resume auto would otherwise continue v888 instead of starting from $WEIGHTS.

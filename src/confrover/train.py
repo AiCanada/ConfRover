@@ -54,6 +54,7 @@ from confrover.env import CachePaths
 from confrover.model.decoder.confdiff.loss import ConfDiffLoss
 from confrover.model.train import ConfRoverTrain
 from confrover.data.dpf.examples import (
+    ReversalPolicy,
     DEFAULT_FORWARD_STRIDE_FRAMES,
     DEFAULT_IID_FRAME_STRIDE,
     DEFAULT_SAMPLES_PER_FAMILY,
@@ -1377,6 +1378,51 @@ def _silence_known_upstream_noise() -> None:
         warnings.filterwarnings("ignore", message=re.escape(prefix))
 
 
+
+def _reversal_policy(args: argparse.Namespace) -> "ReversalPolicy":
+    """Build the time-reversal policy from the CLI, or the off policy.
+
+    ``--time_reversal false`` is a master off switch. ``--traj_burn_in_frames``
+    is the retired name of ``--time_reversal_min_start``; its meaning changed
+    from "delete the window" to "do not reverse it", so it warns rather than
+    silently mapping.
+    """
+    prob = float(getattr(args, "time_reversal_prob", 0.0) or 0.0)
+    if not bool(getattr(args, "time_reversal", False)):
+        prob = 0.0
+    min_start = int(getattr(args, "time_reversal_min_start", 0) or 0)
+    legacy = getattr(args, "traj_burn_in_frames", None)
+    if legacy is not None:
+        log.warning(
+            "--traj_burn_in_frames is retired; using it as "
+            "--time_reversal_min_start %s. The semantics changed: it no longer "
+            "deletes windows that start in the head of a replica (which could "
+            "narrow the stride ladder or empty a family's forward objective), "
+            "it only withholds their reversal.",
+            int(legacy),
+        )
+        min_start = int(legacy)
+    window_frames = int(getattr(args, "window_frames", 1) or 1)
+    if prob > 0 and window_frames <= 1:
+        log.warning(
+            "--time_reversal has no effect at --window_frames 1: reversal is a "
+            "property of a multi-frame window. Recording prob=0."
+        )
+        prob = 0.0
+    policy = ReversalPolicy(
+        prob=prob,
+        max_step=int(getattr(args, "time_reversal_max_step", 0) or 0),
+        min_start=min_start,
+    )
+    if policy.enabled:
+        log.info(
+            f"Time reversal: {policy.prob:g} of forward windows with "
+            f"start >= {policy.min_start} and stride <= {policy.max_step} are "
+            "trained backwards (bag size, permutation and epoch length unchanged)"
+        )
+    return policy
+
+
 def _corpus_label(args: argparse.Namespace) -> str:
     """What the family store holds, for log headers.
 
@@ -1526,8 +1572,7 @@ def run_train(args: argparse.Namespace) -> None:
         samples_per_family=args.samples_per_family,
         static_iid_cap=args.static_iid_cap,
         one_pass_frames=bool(args.one_pass_frames),
-        time_reversal=bool(getattr(args, "time_reversal", False)),
-        burn_in_frames=int(getattr(args, "traj_burn_in_frames", 0) or 0),
+        reversal=_reversal_policy(args),
         window_frames=max(1, int(args.window_frames)),
         sample_seed=args.seed,
         batch_size=args.batch_size,
@@ -1879,16 +1924,41 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "consumed per epoch.",
     )
     data.add_argument(
+        "--time_reversal_min_start",
+        type=int,
+        default=100,
+        help="Do not reverse a window that starts in the first N frames of a "
+        "replica (ATLAS: 100 frames = 1 ns). Every ATLAS replica branches from "
+        "one equilibrated crystal pose, so a replica's head is a relaxation "
+        "transient whose reverse is a relaxation running backwards -- the one "
+        "case the equilibrium path measure does not license. The gate withholds "
+        "the coin; the window is still trained in its real forward direction.",
+    )
+    data.add_argument(
+        "--time_reversal_max_step",
+        type=int,
+        default=64,
+        help="Do not reverse a window whose ladder stride exceeds N frames. A "
+        "W-frame window spans (W-1)*stride: at --window_frames 9 that is 81.9 ns "
+        "of a 100 ns ATLAS replica for stride 1024 and 41.0 ns for 512, so no "
+        "start offset puts those inside a stationary block and reversal is "
+        "unlicensed there. 64 spans 5.1 ns.",
+    )
+    data.add_argument(
+        "--time_reversal_prob",
+        type=float,
+        default=0.5,
+        help="Fraction of ELIGIBLE forward windows trained in reverse temporal "
+        "order (0 disables; --time_reversal false also disables). The coin is a "
+        "hash of the window's own identity, so a given set of 9 conformations "
+        "keeps one orientation for the whole run and the bag, the permutation, "
+        "the epoch length and the LR horizon are identical to a run without it.",
+    )
+    data.add_argument(
         "--traj_burn_in_frames",
         type=int,
-        default=0,
-        help="Skip windows starting in the first N frames of a trajectory "
-        "replica (ATLAS: 100 frames = 1 ns). Time reversal is licensed by the "
-        "equilibrium path measure, and every ATLAS replica branches from one "
-        "equilibrated crystal pose, so a replica's head is a relaxation "
-        "transient whose reverse is a relaxation running backwards. No "
-        "published source quantifies it, so this is 0 by default: set it from "
-        "a measurement, not a guess.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     data.add_argument(
         "--time_reversal",
@@ -1897,14 +1967,19 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         const=True,
         default=True,
         metavar="true|false",
-        help="Also draw every forward window backwards. Equilibrium MD obeys "
-        "detailed balance, so a reversed window is a physical trajectory: this "
-        "doubles the forward population and teaches the dynamics rather than "
-        "the arrow of the recordings. Training windows only -- validation keeps "
-        "the forward-time bag so its loss stays comparable across runs. On by "
-        "default; the runs before it (v888, PDBcluster_from_base, "
-        "dpf_from_PDBcluster, dpf_from_base_v2) predate the flag, so pass "
-        "--time_reversal false to reproduce one of them.",
+        help="Master switch for training some forward windows in reverse "
+        "temporal order (on by default; false forces --time_reversal_prob 0). "
+        "The licence is invariance of the equilibrium path measure under "
+        "reversal (Bolhuis & Swenson 2021), which holds inside a stationary "
+        "block -- hence the --time_reversal_max_step and "
+        "--time_reversal_min_start gates. Orientation is applied to the windows "
+        "a draw returned, not by emitting both orders: emitting both put two "
+        "entries holding the same 9 conformations into the population, which "
+        "broke --one_pass_frames and, because --samples_per_family caps draws, "
+        "halved the ascending content instead of doubling it. Training only; "
+        "validation always keeps the forward-time bag. The runs before the flag "
+        "(v888, PDBcluster_from_base, dpf_from_PDBcluster, dpf_from_base_v2) "
+        "predate it, so pass --time_reversal false to reproduce one.",
     )
     data.add_argument(
         "--one_pass_frames",
