@@ -334,6 +334,19 @@ class DpfTrainDataset(torch.utils.data.Dataset):
                 "with the checkpoint's value, or start a fresh run (--resume none, "
                 "or a new --output) to change the window."
             )
+        saved_reversal = bool(state_dict.get("time_reversal", False))
+        if saved_reversal != bool(self._time_reversal):
+            # Time reversal doubles the forward population, so the one-pass
+            # permutation walk draws different windows for the same epoch:
+            # resuming across the change would neither continue the old bag nor
+            # start the new one cleanly. The flag defaults to on, so this is
+            # what a resume of a run that predates it hits.
+            raise ValueError(
+                f"Checkpoint was trained with --time_reversal {str(saved_reversal).lower()} "
+                f"but this run uses --time_reversal {str(bool(self._time_reversal)).lower()}. "
+                "Resume with the checkpoint's value, or start a fresh run "
+                "(--resume none, or a new --output) to change it."
+            )
         epoch = state_dict.get("epoch")
         if epoch is not None:
             self.set_epoch(int(epoch))

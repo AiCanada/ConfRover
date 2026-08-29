@@ -441,3 +441,22 @@ def test_time_reversal_is_off_by_default_and_is_a_dataset_state_field():
     # validation keeps the forward-time bag: only the train dataset gets the flag
     assert cli.count('time_reversal=bool(getattr(args, "time_reversal", False)),') == 1
 
+
+
+def test_resume_refuses_to_switch_time_reversal_mid_lineage(tmp_path):
+    """Time reversal doubles the forward population, so the one-pass walk draws
+    different windows for the same epoch. The flag now defaults to on, so this
+    is what resuming a run that predates it would otherwise hit silently."""
+    from confrover.data.dpf.dataset import DpfTrainDataset
+
+    ds = DpfTrainDataset.__new__(DpfTrainDataset)
+    ds._sample_seed = 42
+    ds._window_frames = 9
+    ds._time_reversal = True
+    ds._split = None
+    ds._epoch = 0
+    saved = {"epoch": 3, "sample_seed": 42, "window_frames": 9, "time_reversal": False}
+    with pytest.raises(ValueError, match="--time_reversal false"):
+        ds.load_state_dict(saved)
+    saved["time_reversal"] = True
+    ds.load_state_dict(saved)  # matching value resumes
