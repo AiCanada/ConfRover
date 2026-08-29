@@ -26,6 +26,7 @@ from confrover._ext.openfold.utils import rigid_utils as ru
 from confrover.model.confrover import ConfRover
 from confrover.model.decoder.confdiff.loss import ConfDiffLoss
 from confrover.model.utils.checkpoint_activations import unwrap_checkpoint
+from confrover.data.dpf.dataset import REVERSED_KEY
 from confrover.data.dpf.examples import (
     DEFAULT_FORWARD_STRIDE_FRAMES,
     scalar_forward_stride,
@@ -91,6 +92,100 @@ def lr_scale(
     progress = min(max(progress, 0.0), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_ratio + (1.0 - min_ratio) * cosine
+
+
+#: Metric suffixes for the two window orientations. Time reversal is applied at
+#: draw time (data/dpf/examples.py orient_window), so an ascending and a
+#: reversed window are identical in every other field a run logs -- the one
+#: failure mode the augmentation can cause is invisible without this split.
+DIRECTION_ASCENDING = "ascending"
+DIRECTION_REVERSED = "reversed"
+#: Diffusion-time strata, low t first. Thirds of the sampled [tmin, tmax] span,
+#: so with t ~ U(tmin, tmax) each stratum holds a third of the examples.
+T_STRATUM_NAMES: tuple[str, ...] = ("low", "mid", "high")
+#: Cadence for the stratified console line when no Trainer is attached (or it
+#: reports no log_every_n_steps). Same value as
+#: confrover.train.DEFAULT_LOG_EVERY_N_STEPS, which cannot be imported here
+#: because confrover.train imports this module.
+DEFAULT_STRATA_LOG_EVERY_N_STEPS = 50
+
+
+def window_direction(batch: Any) -> str | None:
+    """``"ascending"`` / ``"reversed"`` for a time-ordered forward batch, else None.
+
+    Read off the per-sample ``job_info`` dicts that ``DpfTrainDataset.collate``
+    carries through: ``TrainExample.source`` / ``target`` mirror the first and
+    last entry of the window, and ``orient_window`` moves all four
+    source/target fields together when it flips one, so
+    ``source_frame_idx > target_frame_idx`` is exactly "this window was
+    reversed" and needs nothing added to the dataset.
+
+    Returns None rather than guessing whenever the direction is not a fact:
+
+    * ``iid`` batches are never oriented (``orient_window`` returns them
+      untouched), so they have no direction to report;
+    * a static personality pair -- two deposited PDB-cluster structures -- has
+      no frame index and no time order at all, and calling it "ascending" would
+      pad the very bucket the reversal A/B is trying to isolate;
+    * a batch whose samples disagree, which ``--batch_size 1`` makes
+      impossible today but a sampler could reintroduce.
+    """
+    if not isinstance(batch, dict) or batch.get("task_mode") != "forward":
+        return None
+    directions = set()
+    for info in batch.get("job_info") or ():
+        if not isinstance(info, dict):
+            return None
+        stamped = info.get(REVERSED_KEY)
+        if stamped is not None:
+            directions.add("reversed" if bool(stamped) else "ascending")
+            continue
+        # Fallback for batches built before the stamp existed. Kept because it
+        # is a fact about the same window, not a guess: orient_window moves all
+        # four source/target fields together when it flips one.
+        source = info.get("source_frame_idx")
+        target = info.get("target_frame_idx")
+        if source is None or target is None or int(source) == int(target):
+            return None
+        directions.add(
+            DIRECTION_REVERSED if int(source) > int(target) else DIRECTION_ASCENDING
+        )
+    if len(directions) != 1:
+        return None
+    return directions.pop()
+
+
+def _gate_rows(mask: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    """Zero the rows of a per-example mask for the examples outside a stratum."""
+    if not torch.is_tensor(mask) or mask.dim() < 1 or mask.shape[0] != keep.shape[0]:
+        raise ValueError(
+            f"cannot gate a mask of shape {tuple(getattr(mask, 'shape', ()))} "
+            f"per example against {tuple(keep.shape)}"
+        )
+    return mask * keep.reshape(-1, *([1] * (mask.dim() - 1))).to(mask.dtype)
+
+
+def format_strata_fields(acc: dict[str, tuple[float, float]]) -> str:
+    """``key=value`` fields, space separated, for the stratified console line.
+
+    Kept in the same layout as StepHeartbeat's line because the log readers in
+    this repo split on ``key=value``; a count rides next to every mean so a
+    bucket that saw four examples is not read as a trend.
+    """
+    fields: list[str] = []
+    reversed_n = acc.get(f"loss_{DIRECTION_REVERSED}", (0.0, 0.0))[1]
+    ascending_n = acc.get(f"loss_{DIRECTION_ASCENDING}", (0.0, 0.0))[1]
+    ordered = [f"loss_{DIRECTION_ASCENDING}", f"loss_{DIRECTION_REVERSED}"]
+    ordered += [f"loss_t_{name}" for name in T_STRATUM_NAMES]
+    for key in ordered:
+        total, weight = acc.get(key, (0.0, 0.0))
+        if weight <= 0:
+            continue
+        fields.append(f"{key}={total / weight:.5f}")
+        fields.append(f"n_{key[len('loss_'):]}={weight:g}")
+    if reversed_n + ascending_n > 0:
+        fields.append(f"reversed_frac={reversed_n / (reversed_n + ascending_n):.2f}")
+    return " ".join(fields)
 
 
 class ConfRoverTrain(ConfRover):
@@ -524,6 +619,48 @@ class ConfRoverTrain(ConfRover):
                 on_epoch=True,
                 batch_size=batch_size,
             )
+        # Loss split by window orientation. Time reversal is an augmentation
+        # applied to half the forward windows at draw time; the blended mean is
+        # the only number that reports it, and an ascending window and its
+        # reverse look identical everywhere else in the log, so "the reversed
+        # half is hurting" and "the model is plateauing" read the same.
+        # Logged only on batches whose direction is a fact (see
+        # window_direction), so iid and static PDB-cluster pairs stay out of
+        # both buckets instead of inflating the ascending one.
+        direction = window_direction(batch)
+        if direction is not None:
+            self.log(
+                f"{stage}/loss_{direction}",
+                output["loss"].detach(),
+                on_step=on_step,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
+            # The realized reversal rate, not the configured prob: the policy
+            # skips windows failing max_step / min_start, so the fraction that
+            # actually arrives is the denominator the split above is read over.
+            self.log(
+                f"{stage}/reversed_frac",
+                float(direction == DIRECTION_REVERSED),
+                on_step=on_step,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
+        # Diffusion-time strata. batch_size= is the weight Lightning gives the
+        # value in its epoch mean, so passing the stratum's example count makes
+        # the epoch number a true per-example mean over that third of t rather
+        # than an average of per-step averages over unequal counts.
+        for name, stratum in (output.get("t_strata") or {}).items():
+            count = int(stratum.get("count", 0) or 0)
+            if count <= 0:
+                continue
+            self.log(
+                f"{stage}/loss_t_{name}",
+                float(stratum["loss"]),
+                on_step=on_step,
+                on_epoch=True,
+                batch_size=count,
+            )
         for key, value in output.get("aux_info", {}).items():
             self.log(
                 f"{stage}/{key}",
@@ -532,6 +669,58 @@ class ConfRoverTrain(ConfRover):
                 on_epoch=True,
                 batch_size=batch_size,
             )
+        if stage == "train":
+            self._strata_heartbeat(output, direction)
+
+    # -- stratified console line ---------------------------------------------
+    def _strata_heartbeat(self, output: dict[str, Any], direction: str | None) -> None:
+        """Windowed ``key=value`` line for the splits above.
+
+        The per-step metrics go to whichever Lightning logger is attached, but a
+        laptop run with no logger has only the console, and StepHeartbeat in
+        confrover/train.py prints a fixed field list this module cannot extend.
+        One line per ``log_every_n_steps``, in the same key=value layout, so the
+        existing log readers keep working and a single noisy step is not
+        mistaken for a trend.
+
+        The loss here needs no ``--accumulate_grad_batches`` correction that
+        StepHeartbeat has to apply: Lightning divides by the accumulation factor
+        after ``training_step`` returns, so what arrives here is already in the
+        same units as ``train/loss``.
+        """
+        acc = getattr(self, "_strata_acc", None)
+        if acc is None:
+            acc = self._strata_acc = {}
+        loss = output.get("loss")
+        loss = float(loss.detach()) if torch.is_tensor(loss) else None
+        if direction is not None and loss is not None and math.isfinite(loss):
+            total, weight = acc.get(f"loss_{direction}", (0.0, 0.0))
+            acc[f"loss_{direction}"] = (total + loss, weight + 1.0)
+        for name, stratum in (output.get("t_strata") or {}).items():
+            count = float(int(stratum.get("count", 0) or 0))
+            value = float(stratum.get("loss", 0.0))
+            if count <= 0 or not math.isfinite(value):
+                continue
+            total, weight = acc.get(f"loss_t_{name}", (0.0, 0.0))
+            acc[f"loss_t_{name}"] = (total + value * count, weight + count)
+
+        trainer = getattr(self, "_trainer", None)
+        if trainer is None:
+            return
+        step = int(getattr(trainer, "global_step", 0) or 0)
+        every = int(getattr(trainer, "log_every_n_steps", 0) or 0)
+        if every <= 0:
+            every = DEFAULT_STRATA_LOG_EVERY_N_STEPS
+        # global_step does not advance on every batch under
+        # --accumulate_grad_batches 4, so the interval boundary is hit four
+        # times; _strata_last_step keeps that to one line.
+        if step <= 0 or step % every or step == getattr(self, "_strata_last_step", None):
+            return
+        self._strata_last_step = step
+        fields = format_strata_fields(acc)
+        self._strata_acc = {}
+        if fields:
+            log.info(f"[strata] step={step} {fields}")
 
     def _step(
         self, batch: dict[str, Any], batch_idx: int | None = None
@@ -625,6 +814,11 @@ class ConfRoverTrain(ConfRover):
             # legitimate identity frame sitting at the origin.
             rigids_mask = rigids_mask * structure_mask.to(dtype)
 
+        # Armed before the call so the pre-hook on the loss module sees this
+        # step's predictions; cleared first so a stratum can never be built
+        # from the previous step's tensors.
+        self._loss_call = None
+        captured_ok = self._arm_loss_capture()
         loss, aux_info, _output = self.decoder(
             aatype=aatype,
             s=single_h,
@@ -640,7 +834,182 @@ class ConfRoverTrain(ConfRover):
         )
         aux_info = dict(aux_info)
         aux_info["frames_per_step"] = float(num_frames)
-        return {"loss": loss, "aux_info": aux_info}
+        t_strata = self._t_strata(t) if captured_ok else {}
+        return {"loss": loss, "aux_info": aux_info, "t_strata": t_strata}
+
+    # -- diffusion-time strata -----------------------------------------------
+    def _capture_loss_call(self, module, args, kwargs):
+        """forward_pre_hook: keep the arguments the loss was just called with.
+
+        ConfDiffDecoder calls ``self.loss(...)`` with keywords only. If that ever
+        changes to positional the capture is dropped rather than mis-assigned,
+        and the strata simply stop being reported.
+        """
+        self._loss_call = None if args else dict(kwargs)
+
+    def _arm_loss_capture(self) -> bool:
+        """Hook the live loss module, once. False if the strata cannot be built.
+
+        ``decoder.loss`` is assigned after construction (from_base_checkpoint,
+        and every test that swaps in its own ConfDiffLoss), so the hook is
+        (re)registered whenever the target object changes rather than in
+        __init__.
+        """
+        if getattr(self, "_strata_disabled", False):
+            return False
+        loss_module = getattr(self.decoder, "loss", None)
+        if loss_module is None:
+            return False
+        if getattr(self, "_loss_capture_target", None) is loss_module:
+            return self._loss_capture_ok
+        handle = getattr(self, "_loss_capture_handle", None)
+        if handle is not None:
+            handle.remove()
+        self._loss_capture_target = loss_module
+        try:
+            self._loss_capture_handle = loss_module.register_forward_pre_hook(
+                self._capture_loss_call, with_kwargs=True
+            )
+            self._loss_capture_ok = True
+        except TypeError:  # pragma: no cover - with_kwargs predates torch 2.0
+            self._loss_capture_handle = None
+            self._loss_capture_ok = False
+        return self._loss_capture_ok
+
+    def _t_strata(self, t: torch.Tensor) -> dict[str, dict[str, float]]:
+        """Mean loss in low/mid/high thirds of the sampled t. ``{}`` if unavailable.
+
+        The scalar loss is one mean over every element of every example in the
+        step, and its magnitude is dominated by t: the score terms are divided
+        by score_scaling precisely because the raw IGSO(3)/VP-SDE magnitudes
+        swing ~500x (translation) and ~1100x (rotation) across t, and the atom14
+        term is gated off entirely above ``aux_loss_t_lim``. Three runs
+        plateaued on that single mean with no way to separate "improving at low
+        t, drifting at high t" from "flat everywhere".
+
+        The breakdown has to be per example, not per step: ``_sample_t`` draws
+        one t per example and a ``--window_frames 9`` step therefore holds nine
+        independent draws, so bucketing a step by its mean t would put nearly
+        every step in the middle third.
+
+        Rather than re-deriving the objective here -- which would drift from
+        ConfDiffLoss the moment a weight or a term changed -- this re-evaluates
+        the real loss module on the predictions it was just handed, with the
+        masks of the out-of-stratum examples zeroed. ``_masked_mse`` divides by
+        the mask sum, so a zeroed example leaves the numerator and the
+        denominator together and each stratum is the exact loss restricted to
+        its own examples.
+
+        Two things these numbers are NOT. They do not add up. The atom14 term is
+        gated to ``t < aux_loss_t_lim`` (0.25), and the gate zeroes its
+        denominator too, so that term is the mean over the gate-open examples in
+        whichever call is made: the low stratum reports it at full weight and
+        the others report exactly 0, while the unstratified loss also reports it
+        at full weight. Blending the three by count therefore divides the atom14
+        contribution by the number of strata (three, at one example each), and
+        the blend lands below the reported loss -- pinned by
+        test_the_strata_do_not_add_up_once_the_atom14_gate_splits_the_batch.
+        For the same reason ``loss_t_low`` sits above ``loss_t_high`` by
+        construction and not because the model is worse at low t, so the
+        comparison that means something is a stratum against its own earlier
+        value, never one stratum against another.
+
+        Cost is three extra loss evaluations with no autograd,
+        measured (timing this method against the whole step, W=9, CPU) at 0.8%
+        of a step at L=6 and 0.1% at L=48 -- it shrinks with L because the step
+        is pairformer-bound and the loss is not -- so there is no cadence gate
+        and every step is reported.
+
+        Never fatal: any surprise in the captured arguments disables the
+        breakdown for the rest of the run with one warning, because a log field
+        is not worth killing a 90-epoch fine-tune over.
+        """
+        captured, self._loss_call = getattr(self, "_loss_call", None), None
+        loss_module = getattr(self.decoder, "loss", None)
+        if not captured or loss_module is None:
+            return {}
+        if not torch.is_tensor(t) or t.dim() != 1:
+            return {}
+        try:
+            return self._stratify_loss(loss_module, captured, t)
+        except torch.cuda.OutOfMemoryError:
+            # Never swallow OOM into "breakdown disabled": it is the run's real
+            # failure, the caller has a retry/report path for it, and hiding it
+            # here would turn a diagnosable crash into a mystery slowdown.
+            raise
+        except Exception as exc:  # noqa: BLE001 - reporting must not kill a run
+            self._disable_strata(f"{type(exc).__name__}: {exc}")
+            return {}
+        finally:
+            # _stratify_loss re-invokes the hooked loss module, which fires the
+            # pre-hook again, so clearing _loss_call on the way in is not
+            # enough: without this the last stratum's kwargs -- pred_atom14,
+            # pred_trans_score, pred_rot_score, pred_torsion_sin_cos and
+            # pred_sidechain_frame, each with a live grad_fn -- were still held
+            # when training_step returned, across backward and the optimizer
+            # step. Measured consequence beyond the memory: copy.deepcopy(model)
+            # raised "Only Tensors created explicitly by the user (graph leaves)
+            # support the deepcopy protocol" after any step and succeeded again
+            # once this cleared, i.e. an SWA/EMA-by-deepcopy callback or a
+            # spawn-based strategy would have died mid-run over a log field.
+            self._loss_call = None
+
+    def _disable_strata(self, reason: str) -> None:
+        """Turn the breakdown off for the rest of the run -- hook included.
+
+        Removing the hook matters as much as the flag. Left registered it goes
+        on capturing every step's predictions into ``_loss_call``, which nothing
+        consumes once the flag is set: one step's graph tensors held past
+        backward for a metric that is no longer reported.
+        """
+        self._strata_disabled = True
+        handle = getattr(self, "_loss_capture_handle", None)
+        if handle is not None:
+            handle.remove()
+        self._loss_capture_handle = None
+        self._loss_capture_target = None
+        self._loss_capture_ok = False
+        self._loss_call = None
+        log.warning(
+            "Disabling the t-stratified loss breakdown for the rest of this "
+            f"run: {reason}. Training is unaffected; "
+            f"{'/'.join(f'loss_t_{n}' for n in T_STRATUM_NAMES)} will stop "
+            "being logged."
+        )
+
+    def _stratify_loss(
+        self, loss_module, captured: dict[str, Any], t: torch.Tensor
+    ) -> dict[str, dict[str, float]]:
+        span = max(float(self.tmax) - float(self.tmin), 1e-12)
+        u = ((t.detach().float() - float(self.tmin)) / span).clamp(0.0, 1.0)
+        n_strata = len(T_STRATUM_NAMES)
+        index = torch.clamp((u * n_strata).long(), max=n_strata - 1)
+        # rigids_mask covers the two score terms, torsion_angles_mask the
+        # torsion term, and the atom14 masks the reconstruction term -- between
+        # them every supervised element of an example.
+        atom14_mask_keys = (
+            "atom14_gt_exists",
+            "atom14_atom_exists",
+            "atom14_alt_gt_exists",
+        )
+        strata: dict[str, dict[str, float]] = {}
+        with torch.no_grad():
+            for stratum, name in enumerate(T_STRATUM_NAMES):
+                keep = index == stratum
+                count = int(keep.sum())
+                if count == 0:
+                    continue
+                kwargs = dict(captured)
+                for key in ("rigids_mask", "torsion_angles_mask"):
+                    kwargs[key] = _gate_rows(captured[key], keep)
+                gt_feat = dict(captured["gt_feat"])
+                for key in atom14_mask_keys:
+                    if key in gt_feat:
+                        gt_feat[key] = _gate_rows(gt_feat[key], keep)
+                kwargs["gt_feat"] = gt_feat
+                value = float(loss_module(**kwargs)[0])
+                strata[name] = {"loss": value, "count": count}
+        return strata
 
     def _sample_t(
         self, batch_size: int, device, dtype, batch_idx: int | None = None

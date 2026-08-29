@@ -44,6 +44,7 @@ from .examples import (
     assert_example_in_family,
     build_examples,
     examples_from_split,
+    forward_stride_ladder,
     validate_tasks,
 )
 from .split import DpfSplit
@@ -110,6 +111,77 @@ def _shared_failure_counter() -> mp.Value:
     increment is a read-modify-write.
     """
     return mp.Value("q", 0)
+
+
+#: The keys ``state_dict`` writes that SHAPE the sampling bag, paired with the
+#: flag that sets each one. ``window_frames``, ``reversal`` and ``sample_seed``
+#: are handled individually in ``load_state_dict``; every other bag-shaping key
+#: it writes is checked from here. Recording a key and then ignoring it on the
+#: way back in was the defect: a resume that changed --samples_per_family or
+#: --forward_stride_frames rebuilt a differently sized bag and then applied the
+#: saved loader cursor to it, which is a restart with a misplaced cursor wearing
+#: a resume's name.
+_BAG_SHAPING_KEYS = (
+    ("iid_frame_stride", "_iid_frame_stride", "--iid_frame_stride"),
+    ("samples_per_family", "_samples_per_family", "--samples_per_family"),
+    ("static_iid_cap", "_static_iid_cap", "--static_iid_cap"),
+    ("one_pass_frames", "_one_pass_frames", "--one_pass_frames"),
+    ("forward_stride_frames", "forward_stride_spec", "--forward_stride_frames"),
+    # _apply_epoch passes validate_tasks(self._tasks) into build_examples, so
+    # dropping "forward" halves the bag -- and this key was recorded by nothing
+    # until the coverage test asked why. It is compared as a sorted tuple
+    # because the CLI's order carries no meaning.
+    ("tasks", "_tasks", "--tasks"),
+)
+
+
+def _bag_shaping_value(key: str, value: Any) -> Any:
+    if key == "tasks":
+        return tuple(sorted(str(task) for task in (value or ())))
+    """Comparable form of one shaping value, tolerant of how it was stored.
+
+    ``forward_stride_frames`` is a bare int in the oldest checkpoints, a list
+    after any JSON round trip, and a tuple in memory. What shapes the bag is
+    not the spec but the ladder it expands to, so compare the ladder: probing
+    the object comparison found (8, 1) refused against (1, 8) and (1, 1)
+    refused against 1, both of which ``forward_stride_ladder`` reads as the
+    identical set of frame gaps -- the same bag, refused as a different one.
+    A length other than 1 or 2 is not a spec ``train.stride_spec`` can produce,
+    so those compare as the literal tuple rather than let the ladder raise.
+    """
+    if key == "forward_stride_frames":
+        spec = (
+            tuple(int(v) for v in value)
+            if isinstance(value, (tuple, list))
+            else (int(value),)
+        )
+        if len(spec) == 1:
+            # A 1-tuple is not a legal (lo, hi) range -- forward_stride_ladder
+            # raises on it -- so read it as the scalar it came from.
+            return tuple(forward_stride_ladder(spec[0]))
+        if len(spec) == 2:
+            return tuple(forward_stride_ladder(spec))
+        return spec
+    if key == "one_pass_frames":
+        return bool(value)
+    return int(value)
+
+
+#: job_info key carrying whether a window was trained in reverse temporal
+#: order. Stamped here, at the one place that knows, rather than re-derived
+#: downstream from frame-index key names that a rename would silently break.
+REVERSED_KEY = "reversed"
+
+
+def is_reversed_window(example: TrainExample) -> bool:
+    """True if this example's window runs backwards in trajectory time."""
+    window = example.window
+    if window is None or len(window) < 2:
+        return False
+    frames = [f for _, f in window]
+    if any(f is None for f in frames):
+        return False
+    return frames[0] > frames[-1]
 
 
 def _delta_frames(example: TrainExample, forward_stride_frames: int) -> int:
@@ -312,6 +384,7 @@ class DpfTrainDataset(torch.utils.data.Dataset):
             "one_pass_frames": bool(self._one_pass_frames),
             "reversal": self._reversal.as_dict(),
             "forward_stride_frames": self.forward_stride_spec,
+            "tasks": tuple(self._tasks),
             "window_frames": int(self._window_frames),
         }
 
@@ -339,6 +412,27 @@ class DpfTrainDataset(torch.utils.data.Dataset):
                 "with the checkpoint's value, or start a fresh run (--resume none, "
                 "or a new --output) to change the window."
             )
+        for key, attr, flag in _BAG_SHAPING_KEYS:
+            saved_value = state_dict.get(key)
+            if saved_value is None:
+                # Older checkpoints in this repo predate static_iid_cap,
+                # one_pass_frames and the stride ladder. A key that was never
+                # written says nothing about the bag it was drawn from, so
+                # skipping it is the only honest reading; treating absence as a
+                # mismatch would make every pre-key run unresumable.
+                continue
+            if not hasattr(self, attr):
+                continue
+            this_run = getattr(self, attr)
+            if _bag_shaping_value(key, saved_value) != _bag_shaping_value(key, this_run):
+                raise ValueError(
+                    f"Checkpoint was trained with {flag} {saved_value} but this run "
+                    f"uses {flag} {this_run}. That key shapes the sampling bag, so "
+                    "continuing the checkpoint's loader cursor into this run's bag "
+                    "would be a silent restart with a misplaced cursor, not a "
+                    "resume. Resume with the checkpoint's value, or start a fresh "
+                    "run (--resume none, or a new --output) to change it."
+                )
         saved_policy = state_dict.get("reversal")
         if saved_policy is None:
             # Pre-policy checkpoints. A truthy legacy time_reversal means the bag
@@ -504,6 +598,16 @@ class DpfTrainDataset(torch.utils.data.Dataset):
                 "seqlen": seqlen,
                 "split": self.split_name,
                 "forward_stride_frames": self.forward_stride_frames,
+                # Stamped where the orientation is known. Deriving it downstream
+                # from the frame-index keys works until someone renames one, at
+                # which point the direction split dies green and silent.
+                REVERSED_KEY: is_reversed_window(example),
+                "window_start_frame": (
+                    min(f for _, f in example.window if f is not None)
+                    if example.window is not None
+                    and any(f is not None for _, f in example.window)
+                    else None
+                ),
             },
             "task_mode": example.task_mode,
             "forward_stride_frames": self.forward_stride_frames,

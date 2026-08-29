@@ -411,3 +411,224 @@ def test_reloaded_train_loader_is_measured_on_the_current_epochs_bag():
     # no trainer attached (plain consumers): unchanged behaviour
     dm2 = ConfRoverDataModule(train_dataset=_ShrinkingDS())
     assert len(dm2.train_dataloader()) == -(-N // BATCH)
+
+
+# =============================================================================
+# The other half of a resume: the bag the cursor is being applied to
+# =============================================================================
+#
+# The loader cursor above is only meaningful against the bag it was counted in.
+# DpfTrainDataset.state_dict() records every key that shapes that bag, but
+# load_state_dict used to check only window_frames, reversal and sample_seed --
+# so a resume with a different --samples_per_family or --forward_stride_frames
+# rebuilt a differently sized bag, accepted the saved cursor into it, and
+# reported the whole thing as a resume.
+
+
+def _dpf_stub(**overrides):
+    """A DpfTrainDataset carrying only the attributes load_state_dict reads.
+
+    ``__new__`` rather than ``from_split``: these are pure guard tests, and a
+    real catalog would put toy-PDB example building in front of every one of
+    them. ``test_a_matching_saved_state_resumes...`` below uses the real thing.
+    """
+    from confrover.data.dpf.dataset import DpfTrainDataset
+    from confrover.data.dpf.examples import ReversalPolicy
+
+    ds = DpfTrainDataset.__new__(DpfTrainDataset)
+    ds._split, ds._epoch = None, 0
+    ds._sample_seed = 42
+    ds._window_frames = 9
+    ds._reversal = ReversalPolicy.off()
+    ds._iid_frame_stride = 10
+    ds._samples_per_family = 64
+    ds._static_iid_cap = 8
+    ds._one_pass_frames = False
+    ds._tasks = ["iid", "forward"]
+    ds.forward_stride_spec = (1, 8)
+    for name, value in overrides.items():
+        setattr(ds, name, value)
+    return ds
+
+
+def _dpf_state(**overrides) -> dict:
+    """What ``_dpf_stub()`` writes to a checkpoint, i.e. a matching state."""
+    return _dpf_stub().state_dict() | overrides
+
+
+#: (state_dict key, the attribute this run holds it in, a differing value)
+_SHAPING_CASES = (
+    ("iid_frame_stride", "_iid_frame_stride", 5),
+    ("samples_per_family", "_samples_per_family", 32),
+    ("static_iid_cap", "_static_iid_cap", 16),
+    ("one_pass_frames", "_one_pass_frames", True),
+    ("forward_stride_frames", "forward_stride_spec", (1, 4)),
+    # --tasks shapes the bag through _apply_epoch -> build_examples: dropping
+    # "forward" halves it. It was recorded by nothing until the coverage test
+    # below asked why.
+    ("tasks", "_tasks", ["iid"]),
+)
+
+
+def test_every_bag_shaping_key_state_dict_writes_is_checked_on_the_way_back_in():
+    """The defect was recording a key and then ignoring it, so pin the coverage.
+
+    Without this, adding the next shaping key to state_dict() and forgetting the
+    guard reintroduces exactly the same silent misplaced-cursor resume.
+    """
+    from confrover.data.dpf.dataset import _BAG_SHAPING_KEYS
+
+    written = set(_dpf_stub().state_dict())
+    checked = {key for key, _, _ in _BAG_SHAPING_KEYS} | {
+        # handled individually in load_state_dict, each with its own reasoning
+        "window_frames",
+        "reversal",
+        "sample_seed",
+        "epoch",
+    }
+    assert written == checked, (
+        "state_dict writes keys load_state_dict does not check: "
+        f"{sorted(written - checked)}"
+    )
+
+
+def test_changing_any_bag_shaping_key_on_resume_is_refused_by_name():
+    """Each of these was written to the checkpoint and then silently ignored.
+
+    The message has to name the key and both values, because the operator's fix
+    is to put the checkpoint's value back on the command line.
+    """
+    import pytest
+
+    for key, attr, changed in _SHAPING_CASES:
+        saved = _dpf_state()
+        ds = _dpf_stub(**{attr: changed})
+        with pytest.raises(ValueError) as caught:
+            ds.load_state_dict(saved)
+        message = str(caught.value)
+        assert key in message, message
+        assert str(saved[key]) in message, message
+        assert str(changed) in message, message
+
+
+def test_a_shaping_key_absent_from_an_older_saved_state_is_tolerated():
+    """Checkpoints on disk here predate static_iid_cap, one_pass_frames and the
+    stride ladder; a key that was never written says nothing about the bag, so
+    refusing it would strand runs that are in fact resumable."""
+    for key, _, _ in _SHAPING_CASES:
+        saved = _dpf_state()
+        del saved[key]
+        _dpf_stub().load_state_dict(saved)  # no raise
+
+    # The oldest shape of all: epoch + seed only, from a W=1 run.
+    _dpf_stub(_window_frames=1).load_state_dict({"epoch": 2, "sample_seed": 42})
+
+
+def test_the_forward_stride_spec_compares_tuple_list_and_int_tolerantly():
+    """It has been stored as an int, a list and a tuple across vintages.
+
+    Comparing the stored objects refused resumes whose ladders were identical
+    (1 != [1] != (1,), and a JSON round trip turns every tuple into a list).
+    """
+    import pytest
+
+    for saved, this_run in (
+        (1, 1),
+        (1, (1,)),
+        ((1,), 1),
+        ([1], 1),
+        ([1, 8], (1, 8)),
+        ((1, 8), [1, 8]),
+        ([1, 8], [1, 8]),
+    ):
+        ds = _dpf_stub(forward_stride_spec=this_run)
+        ds.load_state_dict(_dpf_state(forward_stride_frames=saved))  # no raise
+
+    ds = _dpf_stub(forward_stride_spec=(1, 8))
+    with pytest.raises(ValueError, match="forward_stride_frames"):
+        ds.load_state_dict(_dpf_state(forward_stride_frames=[1, 4]))
+    with pytest.raises(ValueError, match="forward_stride_frames"):
+        _dpf_stub(forward_stride_spec=8).load_state_dict(
+            _dpf_state(forward_stride_frames=1)
+        )
+
+
+def test_a_matching_saved_state_resumes_onto_the_saved_epochs_bag(tmp_path):
+    """The guards must not cost the case they exist to protect: same command,
+    same bag, cursor lands where it was counted. Run through a real catalog so
+    the state really is what state_dict writes and set_epoch really rebuilds."""
+    from confrover.data.dpf.catalog import DpfCatalog
+    from confrover.data.dpf.dataset import DpfTrainDataset
+    from confrover.data.dpf.split import DpfSplit, SplitFractions
+
+    from .toys import make_family
+
+    def _build() -> DpfTrainDataset:
+        catalog = DpfCatalog(
+            families=[
+                make_family(tmp_path, f"f{i}", "MKTAYIAK", member_ids=tuple("ABCDE"))
+                for i in range(3)
+            ]
+        )
+        split = DpfSplit.from_catalog(
+            catalog, seed=0, fractions=SplitFractions(1.0, 0.0, 0.0)
+        )
+        return DpfTrainDataset.from_split(
+            catalog,
+            split,
+            "train",
+            tasks=("iid",),
+            samples_per_family=4,
+            iid_frame_stride=2,
+            static_iid_cap=4,
+            forward_stride_frames=(1, 8),
+        )
+
+    live = _build()
+    live.set_epoch(2)
+    saved = live.state_dict()
+
+    resumed = _build()
+    resumed.load_state_dict(saved)
+    assert resumed._epoch == 2
+    assert len(resumed) == len(live)
+
+
+def test_two_stride_specs_naming_one_ladder_are_the_same_bag():
+    """Review probe: the object comparison refused resumes onto an identical bag.
+
+    (8, 1) and (1, 8) both expand to gaps [1, 2, 4, 8] because
+    forward_stride_ladder swaps a descending pair, and (1, 1) expands to [1]
+    exactly as the scalar 1 does -- so all four draw the same examples, but
+    comparing the stored spec objects raised "trained with
+    --forward_stride_frames (8, 1)" and stranded a resumable run.
+    """
+    from confrover.data.dpf.examples import forward_stride_ladder
+
+    for saved, this_run in ((1, (1, 1)), ((1, 1), 1), ((8, 1), (1, 8)), ((1, 8), (8, 1))):
+        assert forward_stride_ladder(saved) == forward_stride_ladder(this_run)
+        ds = _dpf_stub(forward_stride_spec=this_run)
+        ds.load_state_dict(_dpf_state(forward_stride_frames=saved))  # no raise
+
+    # Still refuses two specs whose ladders really do differ.
+    import pytest
+
+    with pytest.raises(ValueError, match="forward_stride_frames"):
+        _dpf_stub(forward_stride_spec=(1, 8)).load_state_dict(
+            _dpf_state(forward_stride_frames=(1, 16))
+        )
+
+
+def test_dropping_a_task_on_resume_is_refused():
+    """--tasks feeds build_examples through _apply_epoch, so resuming
+    'iid,forward' as 'iid' halves the bag and the saved cursor points into a
+    population that no longer exists. Order carries no meaning, so it is
+    compared as a set."""
+    import pytest
+
+    ds = _dpf_stub(_tasks=["iid"])
+    with pytest.raises(ValueError, match="--tasks"):
+        ds.load_state_dict(_dpf_state())
+    # the same two tasks in the other order is the same bag
+    ds = _dpf_stub(_tasks=["forward", "iid"])
+    ds.load_state_dict(_dpf_state())

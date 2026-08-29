@@ -1601,6 +1601,21 @@ def run_train(args: argparse.Namespace) -> None:
             samples_per_family=args.samples_per_family,
             static_iid_cap=args.static_iid_cap,
             one_pass_frames=bool(args.one_pass_frames),
+            # Validation keeps the forward-time bag, always. Reversal rewrites
+            # which conformation a window starts from, so a reversed val bag is
+            # a different set of targets: val/loss would stop being comparable
+            # across --time_reversal_prob, which is exactly the measurement the
+            # flag exists to enable (train-side reversal leaves the population,
+            # permutation, bag size and LR horizon identical -- orient_window --
+            # so the only difference between the two arms must be the training
+            # input, not the yardstick). Also across the epochs of one run, if
+            # the flag ever changed mid-run.
+            # Already the behaviour before this line: from_split defaults
+            # reversal to None and examples_from_split reads that as
+            # ReversalPolicy.off(). Passed explicitly so the omission cannot be
+            # mistaken for an oversight and "re-use the train policy" cannot
+            # look like a tidy-up.
+            reversal=ReversalPolicy.off(),
             window_frames=max(1, int(args.window_frames)),
             sample_seed=args.seed,
             batch_size=args.batch_size,
