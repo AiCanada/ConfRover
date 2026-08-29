@@ -182,8 +182,8 @@ def test_dpf_bootstrap_starts_from_stage_one_and_uses_nine_frame_one_pass_window
                  '--ema_decay "$EMA_DECAY"', '--val_every_n_steps "$VAL_EVERY"',
                  '--time_reversal "$TIME_REVERSAL"'):
         assert knob in text, knob
-    # off by default so a rerun of this script reproduces the v888 recipe
-    assert 'TIME_REVERSAL="${TIME_REVERSAL:-false}"' in text
+    # on by default; TIME_REVERSAL=false reproduces the runs predating the flag
+    assert 'TIME_REVERSAL="${TIME_REVERSAL:-true}"' in text
     # v888's seed checkpoint (run/checkpoints/*) is in the payload manifest, so it
     # is downloaded for the verify step -- but never copied into $RUN, where
     # --resume auto would otherwise continue v888 instead of starting from $WEIGHTS.

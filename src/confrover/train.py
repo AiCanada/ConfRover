@@ -1882,13 +1882,16 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=str2bool,
         nargs="?",
         const=True,
-        default=False,
+        default=True,
         metavar="true|false",
         help="Also draw every forward window backwards. Equilibrium MD obeys "
         "detailed balance, so a reversed window is a physical trajectory: this "
         "doubles the forward population and teaches the dynamics rather than "
         "the arrow of the recordings. Training windows only -- validation keeps "
-        "the forward-time bag so its loss stays comparable across runs.",
+        "the forward-time bag so its loss stays comparable across runs. On by "
+        "default; the runs before it (v888, PDBcluster_from_base, "
+        "dpf_from_PDBcluster, dpf_from_base_v2) predate the flag, so pass "
+        "--time_reversal false to reproduce one of them.",
     )
     data.add_argument(
         "--one_pass_frames",

@@ -60,9 +60,10 @@ WARMUP="${WARMUP:-50}"
 MIN_RATIO="${MIN_RATIO:-0.1}"
 ACCUM="${ACCUM:-1}"
 EMA_DECAY="${EMA_DECAY:-0}"
-# TIME_REVERSAL=true also draws every forward window backwards, doubling the
-# forward pool. Off by default so a rerun reproduces v888.
-TIME_REVERSAL="${TIME_REVERSAL:-false}"
+# Also draw every forward window backwards (detailed balance): doubles the
+# forward pool and teaches the dynamics rather than the arrow of the recordings.
+# On by default; TIME_REVERSAL=false reproduces the runs that predate the flag.
+TIME_REVERSAL="${TIME_REVERSAL:-true}"
 VAL_EVERY="${VAL_EVERY:-500}"
 CKPT_EVERY="${CKPT_EVERY:-500}"
 HF_SYNC="${HF_SYNC:-0}"

@@ -433,7 +433,11 @@ def test_time_reversal_is_off_by_default_and_is_a_dataset_state_field():
     text = (REPO / "src" / "confrover" / "data" / "dpf" / "dataset.py").read_text(encoding="utf-8")
     assert '"time_reversal": bool(self._time_reversal),' in text, "bag identity must record it"
     cli = (REPO / "src" / "confrover" / "train.py").read_text(encoding="utf-8")
-    assert '"--time_reversal"' in cli and "default=False" in cli
+    assert '"--time_reversal"' in cli
+    # on by default (2026-08-29): every run before the flag existed used the
+    # forward-time bag, so reproducing one needs --time_reversal false
+    i = cli.index('"--time_reversal"')
+    assert "default=True," in cli[i:i + 400]
     # validation keeps the forward-time bag: only the train dataset gets the flag
     assert cli.count('time_reversal=bool(getattr(args, "time_reversal", False)),') == 1
 
