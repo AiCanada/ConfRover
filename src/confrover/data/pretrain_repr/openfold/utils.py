@@ -145,4 +145,4 @@ def download_openfold_params(
         shutil.move(download_par_dir / "openfold_params", download_dir)
     shutil.move(dest, download_dir)
 
-    print(f"✅ OpenFold parameters downloaded to: {download_dir}")
+    print(f"OpenFold parameters downloaded to: {download_dir}")

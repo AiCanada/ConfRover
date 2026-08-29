@@ -28,8 +28,8 @@ import mdtraj
 import numpy as np
 import torch
 from lightning.pytorch.utilities import rank_zero_only
-from openfold.np.protein import Protein, to_pdb
-from openfold.np.residue_constants import atom_order
+from confrover._ext.openfold.np.protein import Protein, to_pdb
+from confrover._ext.openfold.np.residue_constants import atom_order
 
 from confrover.utils import PathLike, get_pylogger
 from confrover.utils.misc.process import mp_imap_unordered

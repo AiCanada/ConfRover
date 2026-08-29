@@ -8,3 +8,7 @@ confrover generate --job_config examples/example_iid.json --output examples/outp
 
 # CLI run for example interpolating two conformations
 confrover generate --job_config examples/example_interp.json --output examples/output/cli_example_interp --model ConfRover-interp-20M-v1.0
+
+# Fine-tune ConfRover-base-20M on Dual Personality Fragments (not interp).
+# Requires OpenFold reprs for every train/val seqres. See README "DPF fine-tuning".
+# confrover train --dpf_root "$CONFROVER_DPF_ROOT" --output runs/dpf_base_train --model ConfRover-base-20M-v1.0

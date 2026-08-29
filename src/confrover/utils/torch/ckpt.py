@@ -29,8 +29,6 @@ from lightning.pytorch import LightningModule
 
 from confrover.utils.misc import get_pylogger
 
-from .zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-
 log = get_pylogger(__name__)
 
 # =============================================================================
@@ -67,6 +65,8 @@ def load_state_dict_from_checkpoint(ckpt_path: PathLike):
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
 
     if _is_deepspeed_ckpt(ckpt_path):
+        from .zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
         log.info(f"Loading DeepSpeed checkpoint from {ckpt_path} ...")
         state_dict = get_fp32_state_dict_from_zero_checkpoint(ckpt_path)
         state_dict = OrderedDict(
@@ -104,6 +104,8 @@ def load_model_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
 
     if _is_deepspeed_ckpt(ckpt_path):
+        from .zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
         log.info(f"Loading DeepSpeed checkpoint from {ckpt_path} ...")
         state_dict = get_fp32_state_dict_from_zero_checkpoint(ckpt_path)
         state_dict = OrderedDict(

@@ -45,7 +45,17 @@ def setup_warnings():
 
 @pytest.fixture(autouse=True, scope="session")
 def patch_openfold_deepspeed_bug():
-    from confrover.utils import test_utils
+    try:
+        from confrover.utils import test_utils
+    except ModuleNotFoundError as exc:
+        # Yielding unpatched here lets the whole suite run against the deepspeed
+        # code path this patch exists to avoid: green, but exercising something
+        # other than what the tests claim. A broken install should be loud.
+        pytest.fail(
+            "cannot import confrover.utils.test_utils, so the OpenFold "
+            f"deepspeed CPU patch cannot be applied: {exc}",
+            pytrace=False,
+        )
 
     with test_utils.patch_openfold_deepspeed_bug():
         yield

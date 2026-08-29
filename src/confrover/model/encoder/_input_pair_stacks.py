@@ -29,23 +29,23 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from openfold.model.dropout import (
+from confrover._ext.openfold.model.dropout import (
     DropoutColumnwise,
     DropoutRowwise,
 )
-from openfold.model.pair_transition import PairTransition
-from openfold.model.primitives import LayerNorm
-from openfold.model.triangular_attention import (
+from confrover._ext.openfold.model.pair_transition import PairTransition
+from confrover._ext.openfold.model.primitives import LayerNorm
+from confrover._ext.openfold.model.triangular_attention import (
     TriangleAttentionEndingNode,
     TriangleAttentionStartingNode,
 )
-from openfold.model.triangular_multiplicative_update import (
+from confrover._ext.openfold.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
-from openfold.utils.checkpointing import checkpoint_blocks
-from openfold.utils.chunk_utils import ChunkSizeTuner
-from openfold.utils.tensor_utils import add
+from confrover._ext.openfold.utils.checkpointing import checkpoint_blocks
+from confrover._ext.openfold.utils.chunk_utils import ChunkSizeTuner
+from confrover._ext.openfold.utils.tensor_utils import add
 
 
 class InputPairStackBlock(nn.Module):

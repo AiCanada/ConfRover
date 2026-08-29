@@ -34,9 +34,9 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-from openfold.np import residue_constants as rc
-from openfold.utils import rigid_utils as ru
-from openfold.utils.feats import (
+from confrover._ext.openfold.np import residue_constants as rc
+from confrover._ext.openfold.utils import rigid_utils as ru
+from confrover._ext.openfold.utils.feats import (
     frames_and_literature_positions_to_atom14_pos,
     torsion_angles_to_frames,
 )
@@ -303,10 +303,13 @@ class ConfDiffNetwork(nn.Module):
                 persistent=False,
             )
         if not hasattr(self, "group_idx"):
+            # Must be int64: torch 2.1 F.one_hot rejects int32, and Windows
+            # numpy ``dtype=int`` is int32.
             self.register_buffer(
                 "group_idx",
                 torch.tensor(
                     rc.restype_atom14_to_rigid_group,
+                    dtype=torch.long,
                     device=device,
                     requires_grad=False,
                 ),

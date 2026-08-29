@@ -45,7 +45,17 @@ If you spot a problem with the problem, [search if an issue already exists](http
 
 ### Solve an issue
 
-Please check `DEVELOPMENT.md` in sub folder to get familar with running and testing codes.
+See the root [README](README.md) for install, generate, and DPF train. There is no separate `DEVELOPMENT.md`.
+
+```bash
+# Official generate smoke (GPU)
+python -m pytest tests/infer -o addopts= -q
+
+# DPF train / split / loss (mostly CPU)
+python -m pytest tests/dpf -o addopts= -q
+```
+
+Do not put personalities or frames of the same family on different split sides. Do not add DPF split keys onto `GenDataset` / `data/infer.py`.
 
 ### Open a Pull request.
 

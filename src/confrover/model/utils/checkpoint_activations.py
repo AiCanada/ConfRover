@@ -94,7 +94,13 @@ def _checkpointed_forward(original_forward, offload_to_cpu, *args, **kwargs):
     # the backward must return gradients (or None) for every input argument.
     # We can flatten keyword arguments to make this easier.
     kwarg_keys, flat_args = pack_kwargs(*args, **kwargs)
-    parent_ctx_dict = {"offload": offload_to_cpu}
+    # Grad mode must be sampled HERE, in the caller's context. Inside
+    # CheckpointFunction.forward torch has already disabled it, so the check in
+    # there could never fire -- see the note at its top.
+    parent_ctx_dict = {
+        "offload": offload_to_cpu,
+        "grad_enabled": torch.is_grad_enabled(),
+    }
     output = CheckpointFunction.apply(
         original_forward, parent_ctx_dict, kwarg_keys, *flat_args
     )
@@ -192,7 +198,15 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, run_function, parent_ctx_dict, kwarg_keys, *args):
-        if torch.is_grad_enabled():  # grad may be disabled, e.g., during validation
+        # torch.is_grad_enabled() is ALWAYS False in here -- autograd disables
+        # grad mode for the duration of Function.forward -- so testing it made
+        # this warning unreachable, and a checkpointed module whose inputs all
+        # have requires_grad=False was frozen in silence. That is exactly how
+        # the decoder embedder lost gradient on 20 tensors for a whole
+        # fine-tune. _checkpointed_forward samples the caller's grad mode and
+        # passes it in, so the warning fires when training and stays quiet
+        # under no_grad, which is what the original test was reaching for.
+        if parent_ctx_dict.get("grad_enabled", False):
             checkpoint.check_backward_validity(args)
 
         ctx.run_function = run_function

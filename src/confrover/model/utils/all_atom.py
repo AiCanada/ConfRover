@@ -17,8 +17,8 @@
 from __future__ import annotations
 
 import torch
-from openfold.np import residue_constants as rc
-from openfold.utils.tensor_utils import batched_gather
+from confrover._ext.openfold.np import residue_constants as rc
+from confrover._ext.openfold.utils.tensor_utils import batched_gather
 
 """Construct denser atom positions (14 dimensions instead of 37)."""
 restype_atom37_to_atom14 = []

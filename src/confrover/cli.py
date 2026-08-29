@@ -30,8 +30,12 @@ from confrover.data.pretrain_repr.openfold.make_openfold_repr import (
 )
 from confrover.inference import add_args as _add_generate_args
 from confrover.inference import cli as _generate_cli
-from confrover.utils import get_pylogger
+from confrover.train import add_args as _add_train_args
+from confrover.train import cli as _train_cli
+from confrover.utils import configure_stdio, get_pylogger, install_debug_hooks
 
+configure_stdio()
+install_debug_hooks()
 log = get_pylogger(__name__)
 
 # =============================================================================
@@ -80,13 +84,27 @@ def build_parser():
     generate_parser = _add_generate_args(generate_parser)
     generate_parser.set_defaults(func=_generate_cli)
 
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Fine-tune ConfRover-base-20M on Dual Personality Fragments.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    train_parser = _add_train_args(train_parser)
+    train_parser.set_defaults(func=_train_cli)
+
     return main_parser
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except SystemExit:
+        raise
+    except BaseException:
+        log.exception("Uncaught exception in `confrover %s`", getattr(args, "command", "?"))
+        raise
 
 
 if __name__ == "__main__":

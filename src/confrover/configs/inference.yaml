@@ -1,4 +1,5 @@
 # @package _global_
+# Generate-only Hydra config. DPF training uses `confrover train`, not this file.
 
 model_ckpt: null
 output_dir: ???
